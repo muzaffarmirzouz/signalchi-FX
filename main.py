@@ -97,6 +97,21 @@ def zone_text(z) -> str:
     return f"{fmt(z['low'])} – {fmt(z['high'])}"
 
 
+SIDE_WORDS = {"BUY": "BUY", "B": "BUY", "LONG": "BUY", "SELL": "SELL", "S": "SELL", "SHORT": "SELL"}
+
+
+def side_label(side) -> str:
+    return {"BUY": "🟢 BUY", "SELL": "🔴 SELL"}.get(side, "⚪️ aniqlanmagan")
+
+
+def side_header(side) -> str:
+    if side == "BUY":
+        return "🟢🟢🟢 <b>DIQQAT BUY</b> 🟢🟢🟢"
+    if side == "SELL":
+        return "🔴🔴🔴 <b>DIQQAT SELL</b> 🔴🔴🔴"
+    return "🎯 <b>DIQQAT! Narx zonaga yetdi</b>"
+
+
 # ───────────────────────── zona mantig'i ─────────────────────────
 
 def zone_state(z, price: float) -> str:
@@ -127,7 +142,7 @@ def check_zone(z, price: float):
 
 def signal_text(z, price: float, how: str) -> str:
     lines = [
-        "🎯 <b>Narx zonaga yetdi!</b>",
+        side_header(z.get("side")),
         "",
         f"📈 Juftlik: <b>{esc(z['symbol'])}</b>",
         f"💰 Narx: <b>{fmt(price)}</b>",
@@ -293,9 +308,11 @@ async def price_loop():
 HELP = (
     "🤖 <b>Zona signal bot</b>\n\n"
     "<b>Zona qo'shish:</b>\n"
-    "<code>/zona XAUUSD 4150 4160</code> — narx shu oraliqqa kirsa signal\n"
-    "<code>/zona XAUUSD 4200</code> — narx shu darajani kesib o'tsa signal\n"
-    "<code>/zona oltin 4100 4110 support</code> — izoh bilan\n\n"
+    "<code>/buy XAUUSD 4150 4160</code> — BUY zona (signal: DIQQAT BUY)\n"
+    "<code>/sell XAUUSD 4250 4260</code> — SELL zona (signal: DIQQAT SELL)\n"
+    "<code>/buy XAUUSD 4150 SL 4140</code> — bitta daraja + izoh\n"
+    "<code>/zona XAUUSD 4150 4160</code> — yo'nalishni bot o'zi aniqlaydi:\n"
+    "    zona narxdan pastda → BUY, yuqorida → SELL\n\n"
     "<b>Boshqa buyruqlar:</b>\n"
     "/zonalar — faol zonalar ro'yxati\n"
     "<code>/ochir 3</code> — 3-raqamli zonani o'chirish\n"
@@ -308,16 +325,29 @@ HELP = (
 )
 
 
-async def cmd_zona(chat_id, args):
+async def cmd_buy(chat_id, args):
+    await cmd_zona(chat_id, args, side="BUY")
+
+
+async def cmd_sell(chat_id, args):
+    await cmd_zona(chat_id, args, side="SELL")
+
+
+async def cmd_zona(chat_id, args, side=None):
     global next_id
     if len(args) < 2 or not is_num(args[1]):
-        return await send(chat_id, "Namuna: <code>/zona XAUUSD 4150 4160</code> yoki <code>/zona XAUUSD 4150</code>")
+        cmd = {"BUY": "/buy", "SELL": "/sell"}.get(side, "/zona")
+        return await send(chat_id, f"Namuna: <code>{cmd} XAUUSD 4150 4160</code> yoki <code>{cmd} XAUUSD 4150</code>")
     symbol = norm_symbol(args[0])
     a = parse_num(args[1])
     rest = args[2:]
     b = a
     if rest and is_num(rest[0]):
         b = parse_num(rest[0])
+        rest = rest[1:]
+    # /zona XAUUSD 4150 4160 buy — yo'nalish so'z bilan ham yozilishi mumkin
+    if side is None and rest and rest[0].upper() in SIDE_WORDS:
+        side = SIDE_WORDS[rest[0].upper()]
         rest = rest[1:]
     low, high = min(a, b), max(a, b)
     if low <= 0:
@@ -331,6 +361,10 @@ async def cmd_zona(chat_id, args):
 
     z = {"id": next_id, "symbol": symbol, "low": low, "high": high, "note": " ".join(rest)[:200]}
     z["state"] = zone_state(z, price)
+    auto = side is None
+    if auto:  # zona narxdan pastda — support (BUY), yuqorida — resistance (SELL)
+        side = {"above": "BUY", "below": "SELL"}.get(z["state"])
+    z["side"] = side
     zones.append(z)
     next_id += 1
     save_zones()
@@ -338,6 +372,7 @@ async def cmd_zona(chat_id, args):
     msg = [
         f"✅ <b>#{z['id']} zona qo'shildi</b>",
         f"📈 {esc(symbol)}",
+        f"🧭 Yo'nalish: <b>{side_label(side)}</b>" + (" (avtomatik)" if auto and side else ""),
         f"📍 Zona: <b>{zone_text(z)}</b>",
         f"💰 Hozirgi narx: {fmt(price)}",
     ]
@@ -345,6 +380,9 @@ async def cmd_zona(chat_id, args):
         msg.append(f"📝 {esc(z['note'])}")
     if z["state"] == "in":
         msg.append("\n⚠️ Narx hozir zona ichida. Zonadan chiqib, qayta kirsa signal beraman.")
+    if side is None:
+        msg.append("⚠️ Yo'nalishni aniqlab bo'lmadi. BUY yoki SELL kerak bo'lsa, "
+                   f"<code>/ochir {z['id']}</code> qilib, <code>/buy</code> yoki <code>/sell</code> bilan qayta qo'shing.")
     await send(chat_id, "\n".join(msg))
 
 
@@ -357,7 +395,8 @@ async def cmd_zonalar(chat_id, _):
         p = prices.get(z["symbol"])
         now = f" · hozir {fmt(p)}" if p is not None else ""
         note = f"\n    📝 {esc(z['note'])}" if z.get("note") else ""
-        lines.append(f"<b>#{z['id']}</b> {esc(z['symbol'])}: {zone_text(z)}{now}{note}")
+        mark = {"BUY": "🟢 BUY", "SELL": "🔴 SELL"}.get(z.get("side"), "⚪️")
+        lines.append(f"<b>#{z['id']}</b> {mark} {esc(z['symbol'])}: {zone_text(z)}{now}{note}")
     lines.append("\nO'chirish: <code>/ochir raqam</code>")
     await send(chat_id, "\n".join(lines))
 
@@ -398,6 +437,8 @@ COMMANDS = {
     "/start": cmd_help,
     "/help": cmd_help,
     "/zona": cmd_zona,
+    "/buy": cmd_buy,
+    "/sell": cmd_sell,
     "/zonalar": cmd_zonalar,
     "/ochir": cmd_ochir,
     "/tozala": cmd_tozala,
@@ -428,7 +469,9 @@ async def handle_message(msg):
 async def poll_loop():
     await tg("deleteWebhook")
     await tg("setMyCommands", commands=[
-        {"command": "zona", "description": "Zona qo'shish: /zona XAUUSD 4150 4160"},
+        {"command": "buy", "description": "BUY zona: /buy XAUUSD 4150 4160"},
+        {"command": "sell", "description": "SELL zona: /sell XAUUSD 4250 4260"},
+        {"command": "zona", "description": "Zona (yo'nalish avtomatik): /zona XAUUSD 4150 4160"},
         {"command": "zonalar", "description": "Faol zonalar ro'yxati"},
         {"command": "ochir", "description": "Zonani o'chirish: /ochir 3"},
         {"command": "tozala", "description": "Hamma zonani o'chirish"},
@@ -479,7 +522,9 @@ SKIP = {"secret", "key"}
 def format_message(data) -> str:
     if not isinstance(data, dict):
         return f"🔔 <b>TradingView signal</b>\n\n{esc(data)}"
-    lines = ["🔔 <b>TradingView signal</b>", ""]
+    sig = str(data.get("signal", "")).upper()
+    side = "BUY" if ("BUY" in sig or "LONG" in sig) else "SELL" if ("SELL" in sig or "SHORT" in sig) else None
+    lines = [side_header(side) if side else "🔔 <b>TradingView signal</b>", ""]
     used = set()
     for key, label in FIELDS:
         if data.get(key) not in (None, ""):
