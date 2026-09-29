@@ -16,6 +16,10 @@ Railway Variables:
   PIP_TARGETS     - (ixtiyoriy) signaldan keyin qaysi pips'larda xabar berish, standart "50,100,150,200"
   TRACK_HOURS     - (ixtiyoriy) signal necha soat kuzatiladi, standart 48
   PIP_SIZES       - (ixtiyoriy) 1 pip qiymati, masalan "XAUUSD:0.1,BTCUSDT:1"
+  FEED_MAX_AGE    - (ixtiyoriy) MT5 narxi necha soniyagacha yangi hisoblanadi, standart 60
+
+MT5 (Exness) narxi: MT5'dagi ZonaPriceFeed EA har 3 soniyada /price ga narx yuboradi.
+Yangi MT5 narxi bo'lsa, bot shuni ishlatadi, bo'lmasa Bitget / gold-api / Binance'ga o'tadi.
 """
 
 import os
@@ -45,7 +49,12 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 ZONES_FILE = DATA_DIR / "zones.json"
 PRICE_API = os.environ.get("PRICE_API", "https://data-api.binance.vision/api/v3/ticker/price")
 METAL_API = os.environ.get("METAL_API", "https://api.gold-api.com/price")
-METAL_CACHE = float(os.environ.get("METAL_CACHE", 30))  # gold-api har ~30 soniyada yangilanadi
+METAL_CACHE = float(os.environ.get("METAL_CACHE", 5))
+BITGET_API = os.environ.get("BITGET_API", "https://api.bitget.com/api/v2/mix/market/ticker")
+# Bitget'dagi oltin/kumush kontraktlari. "index" — spot oltin indeksi (Exness kabi spot brokerlarga yaqin),
+# "last" — kontraktning o'z narxi.
+BITGET_SYMBOLS = {"XAUUSD": "XAUUSDT", "XAGUSD": "XAGUSDT"}
+GOLD_PRICE_FIELD = os.environ.get("GOLD_PRICE_FIELD", "index").lower()
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 PIP_TARGETS = sorted({int(x) for x in os.environ.get("PIP_TARGETS", "50,100,150,200").split(",") if x.strip().isdigit()})
 TRACK_HOURS = float(os.environ.get("TRACK_HOURS", 48))
@@ -56,7 +65,7 @@ for _item in os.environ.get("PIP_SIZES", "").split(","):
         _k, _v = _item.split(":", 1)
         PIP_SIZES[_k.strip().upper()] = float(_v)
 
-# Metallar gold-api.com'dan, qolganlari Binance'dan olinadi
+# Metallar Bitget (zaxira: gold-api.com) dan, qolganlari Binance'dan olinadi
 METALS = {"XAUUSD": "XAU", "XAGUSD": "XAG"}
 ALIASES = {
     "XAU": "XAUUSD", "GOLD": "XAUUSD", "OLTIN": "XAUUSD", "XAUUSD": "XAUUSD",
@@ -68,7 +77,11 @@ zones = []           # [{id, symbol, low, high, note, state, side}]
 trades = []          # signal chiqqandan keyin kuzatilayotganlar
 next_id = 1
 tasks = []
-metal_cache = {}     # {"XAUUSD": (vaqt, narx)}
+metal_cache = {}     # {"XAUUSD": (vaqt, narx, manba)}
+offsets = {}         # /tuzat bilan: {"XAUUSD": [0.85, "Bitget"]} — Exness narxi va manba orasidagi farq
+feed_prices = {}     # MT5'dan kelgan narxlar: {"XAUUSD": (vaqt, bid, ask)}
+FEED_MAX_AGE = float(os.environ.get("FEED_MAX_AGE", 60))
+last_source = {}     # {"XAUUSD": "MT5"} — manba almashganini logga yozish uchun
 
 
 # ───────────────────────── yordamchi funksiyalar ─────────────────────────
@@ -261,6 +274,8 @@ def load_zones():
         data = json.loads(ZONES_FILE.read_text(encoding="utf-8"))
         zones, next_id = data.get("zones", []), data.get("next_id", 1)
         trades[:] = data.get("trades", [])
+        offsets.clear()
+        offsets.update({k: v for k, v in data.get("offsets", {}).items() if isinstance(v, list)})
         log.info("%d ta zona, %d ta kuzatilayotgan signal yuklandi", len(zones), len(trades))
     except FileNotFoundError:
         zones, next_id = [], 1
@@ -272,7 +287,7 @@ def load_zones():
 def save_zones():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = ZONES_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades}, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades, "offsets": offsets}, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(ZONES_FILE)
 
 
@@ -308,28 +323,105 @@ async def broadcast(text: str, reply_to: dict = None):
     return ids
 
 
-async def fetch_metal(symbol: str):
-    """XAUUSD/XAGUSD narxi gold-api.com'dan (30 soniya keshlanadi)."""
+async def fetch_bitget(symbol: str):
+    """Bitget'dan oltin/kumush narxi. Eskirgan (2 daqiqadan eski) narxni qaytarmaydi."""
+    params = {"symbol": BITGET_SYMBOLS[symbol], "productType": "USDT-FUTURES"}
+    async with http.get(BITGET_API, params=params) as r:
+        data = await r.json()
+    if str(data.get("code")) != "00000" or not data.get("data"):
+        raise ValueError(f"Bitget javobi: {data}")
+    d = data["data"][0] if isinstance(data["data"], list) else data["data"]
+    ts = float(d.get("ts") or 0) / 1000
+    if ts and time.time() - ts > 120:
+        raise ValueError(f"Bitget narxi eskirgan ({time.time() - ts:.0f}s)")
+    if GOLD_PRICE_FIELD == "index" and d.get("indexPrice"):
+        return float(d["indexPrice"])
+    return float(d.get("bidPr") or d["lastPr"])
+
+
+async def fetch_goldapi(symbol: str):
+    """gold-api.com — zaxira manba. 10 daqiqadan eski narxni qabul qilmaydi."""
+    from datetime import datetime, timezone
+    async with http.get(f"{METAL_API}/{METALS[symbol]}") as r:
+        if r.status != 200:
+            raise ValueError(f"{r.status}: {await r.text()}")
+        data = await r.json()
+    upd = data.get("updatedAt")
+    if upd:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(upd.replace("Z", "+00:00"))).total_seconds()
+        if age > 600:
+            raise ValueError(f"gold-api narxi eskirgan ({age / 3600:.1f} soat)")
+    return float(data["price"])
+
+
+async def fetch_metal_raw(symbol: str):
+    """(narx, manba) — tuzatishsiz. Avval Bitget, bo'lmasa gold-api."""
     now = asyncio.get_running_loop().time()
     cached = metal_cache.get(symbol)
     if cached and now - cached[0] < METAL_CACHE:
-        return cached[1]
-    try:
-        async with http.get(f"{METAL_API}/{METALS[symbol]}") as r:
-            if r.status != 200:
-                raise ValueError(f"{r.status}: {await r.text()}")
-            price = float((await r.json())["price"])
-        metal_cache[symbol] = (now, price)
-        return price
-    except Exception as e:
-        log.warning("%s narxi olinmadi: %s", symbol, e)
-        return cached[1] if cached and now - cached[0] < 120 else None
+        return cached[1], cached[2]
+    for name, fn in (("Bitget", fetch_bitget), ("gold-api.com", fetch_goldapi)):
+        try:
+            price = await fn(symbol)
+            metal_cache[symbol] = (now, price, name)
+            return price, name
+        except Exception as e:
+            log.warning("%s: %s narxi olinmadi: %s", name, symbol, e)
+    if cached and now - cached[0] < 120:
+        return cached[1], cached[2]
+    return None, None
+
+
+async def fetch_metal(symbol: str):
+    """Exness'ga moslangan narx: manba narxi + /tuzat farqi."""
+    price, src = await fetch_metal_raw(symbol)
+    if price is None:
+        return None
+    return price + offset_for(symbol, src)
+
+
+def offset_for(symbol: str, src) -> float:
+    """Tuzatish faqat u hisoblangan manbaga qo'llanadi (Bitget farqi gold-api'ga qo'shilmaydi)."""
+    o = offsets.get(symbol)
+    if isinstance(o, list) and len(o) == 2 and o[1] == src:
+        return float(o[0])
+    return 0.0
+
+
+def feed_price(symbol: str):
+    """MT5'dan kelgan yangi narx (bid) yoki None."""
+    f = feed_prices.get(symbol)
+    if f and time.time() - f[0] <= FEED_MAX_AGE:
+        return f[1]
+    return None
+
+
+def price_source(symbol: str) -> str:
+    if feed_price(symbol) is not None:
+        return "Exness MT5"
+    if symbol in METALS:
+        c = metal_cache.get(symbol)
+        name = c[2] if c else "Bitget"
+        off = offset_for(symbol, name)
+        return f"{name}, Exness'ga moslangan ({off:+.2f})" if off else name
+    return "Binance"
 
 
 async def fetch_prices(symbols):
     """{'BTCUSDT': 64500.1, 'XAUUSD': 4165.2, ...}. Topilmaganlar natijada bo'lmaydi."""
     symbols = sorted(set(symbols))
     out = {}
+    # 1) MT5 (Exness) narxi bo'lsa — eng aniq manba
+    for s in symbols:
+        p = feed_price(s)
+        if p is not None:
+            out[s] = p
+        src = price_source(s)
+        if last_source.get(s) != src:
+            if s in last_source:
+                log.warning("%s narx manbasi o'zgardi: %s -> %s", s, last_source[s], src)
+            last_source[s] = src
+    symbols = [s for s in symbols if s not in out]
     for s in [s for s in symbols if s in METALS]:
         p = await fetch_metal(s)
         if p is not None:
@@ -446,6 +538,7 @@ HELP = (
     "/tozala — hamma zonani o'chirish\n"
     "<code>/narx XAUUSD</code> — hozirgi narx\n"
     "/signallar — signal chiqqandan keyin necha pips yurgani\n"
+    "<code>/tuzat XAUUSD 4181.35</code> — narxni Exness'ga moslash\n"
     "<code>/yopish 3</code> — signal kuzatuvini to'xtatish\n\n"
     "<b>Signaldan keyin:</b> bot narxni kuzatadi va +50, +100 pips yurganda "
     "signal postiga reply qilib yozadi. Izohda SL/TP bo'lsa, urilganini ham yozadi.\n\n"
@@ -505,7 +598,7 @@ async def cmd_zona(chat_id, args, side=None):
         f"📈 {esc(symbol)}",
         f"🧭 Yo'nalish: <b>{side_label(side)}</b>" + (" (avtomatik)" if auto and side else ""),
         f"📍 Zona: <b>{zone_text(z)}</b>",
-        f"💰 Hozirgi narx: {fmt(price)}",
+        f"💰 Hozirgi narx: {fmt(price)} <i>({price_source(symbol)})</i>",
     ]
     if z["note"]:
         msg.append(f"📝 {esc(z['note'])}")
@@ -556,8 +649,10 @@ async def cmd_narx(chat_id, args):
     symbol = norm_symbol(args[0])
     p = (await fetch_prices([symbol])).get(symbol)
     if p is None:
+        if symbol in METALS:
+            return await send(chat_id, f"❌ {esc(symbol)} narxini hozir olib bo'lmadi. Bozor yopiq bo'lishi mumkin yoki birozdan keyin urinib ko'ring.")
         return await send(chat_id, f"❌ {esc(symbol)} topilmadi.")
-    await send(chat_id, f"💰 <b>{esc(symbol)}</b>: {fmt(p)}")
+    await send(chat_id, f"💰 <b>{esc(symbol)}</b>: {fmt(p)}\n<i>Manba: {price_source(symbol)}</i>")
 
 
 async def cmd_signallar(chat_id, _):
@@ -586,6 +681,43 @@ async def cmd_yopish(chat_id, args):
     await send(chat_id, f"⏹ {n} ta signal kuzatuvi to'xtatildi." if n else "Bunday raqamli signal topilmadi.")
 
 
+async def cmd_tuzat(chat_id, args):
+    """/tuzat XAUUSD 4181.35 — Exness'dagi hozirgi narxni yozasiz, bot farqni eslab qoladi."""
+    if len(args) < 2:
+        lines = ["Exness'dagi hozirgi <b>Bid</b> (Продажа) narxini yozing:",
+                 "<code>/tuzat XAUUSD 4181.35</code>", "", "Tuzatishni o'chirish: <code>/tuzat XAUUSD off</code>"]
+        if offsets:
+            lines += ["", "Hozirgi tuzatishlar:"] + [f"• {esc(k)}: {v[0]:+.2f} ({esc(v[1])})" for k, v in offsets.items()]
+        return await send(chat_id, "\n".join(lines))
+    symbol = norm_symbol(args[0])
+    if symbol not in METALS:
+        return await send(chat_id, "Tuzatish faqat XAUUSD va XAGUSD uchun.")
+    if args[1].lower() in ("off", "0", "reset", "ochir"):
+        offsets.pop(symbol, None)
+        save_zones()
+        return await send(chat_id, f"✅ {esc(symbol)} tuzatishi o'chirildi.")
+    if not is_num(args[1]):
+        return await send(chat_id, "Namuna: <code>/tuzat XAUUSD 4181.35</code>")
+    metal_cache.pop(symbol, None)  # eng yangi narx bilan solishtiramiz
+    raw, src = await fetch_metal_raw(symbol)
+    if raw is None:
+        return await send(chat_id, "❌ Hozir narxni olib bo'lmadi, birozdan keyin urinib ko'ring.")
+    exness = parse_num(args[1])
+    off = exness - raw
+    if abs(off) > raw * 0.01:
+        return await send(chat_id, f"⚠️ Farq juda katta ({off:+.2f}). Narxni to'g'ri yozdingizmi? {esc(src)}: {fmt(raw)}")
+    offsets[symbol] = [round(off, 3), src]
+    save_zones()
+    await send(chat_id, "\n".join([
+        f"✅ <b>{esc(symbol)} Exness'ga moslandi</b>",
+        f"{esc(src)}: {fmt(raw)}",
+        f"Exness: {fmt(exness)}",
+        f"Farq: <b>{off:+.2f}</b> — endi hamma narxlarga qo'shiladi.",
+        "",
+        "<i>Farq vaqt o'tishi bilan biroz o'zgaradi — kuniga bir marta qayta /tuzat qilib turing.</i>",
+    ]))
+
+
 async def cmd_help(chat_id, _):
     await send(chat_id, HELP)
 
@@ -601,6 +733,7 @@ COMMANDS = {
     "/tozala": cmd_tozala,
     "/narx": cmd_narx,
     "/signallar": cmd_signallar,
+    "/tuzat": cmd_tuzat,
     "/yopish": cmd_yopish,
 }
 
@@ -636,6 +769,7 @@ async def poll_loop():
         {"command": "tozala", "description": "Hamma zonani o'chirish"},
         {"command": "narx", "description": "Hozirgi narx: /narx XAUUSD"},
         {"command": "signallar", "description": "Kuzatilayotgan signallar (pips)"},
+        {"command": "tuzat", "description": "Narxni Exness'ga moslash: /tuzat XAUUSD 4181.35"},
         {"command": "yopish", "description": "Signal kuzatuvini to'xtatish: /yopish 3"},
         {"command": "help", "description": "Yordam"},
     ])
@@ -721,8 +855,29 @@ async def webhook(request):
     return web.Response(text="ok")
 
 
+async def price_feed(request):
+    """MT5 EA narx yuboradi: {"symbol": "XAUUSD", "bid": 4181.2, "ask": 4181.4}"""
+    if SECRET and request.query.get("key", "") != SECRET:
+        return web.Response(status=403, text="forbidden")
+    try:
+        data = json.loads(await request.text())
+        symbol = norm_symbol(str(data["symbol"]))
+        bid = float(data["bid"])
+        ask = float(data.get("ask") or bid)
+        if bid <= 0:
+            raise ValueError("bid <= 0")
+    except Exception as e:
+        return web.Response(status=400, text=f"xato: {e}")
+    first = symbol not in feed_prices
+    feed_prices[symbol] = (time.time(), bid, ask)
+    if first:
+        log.info("MT5 narxi kela boshladi: %s %s", symbol, bid)
+    return web.Response(text="ok")
+
+
 async def health(_):
-    return web.Response(text=f"Zona bot ishlayapti ✅ ({len(zones)} ta faol zona)")
+    feeds = ", ".join(f"{s}={fmt(v[1])} ({time.time() - v[0]:.0f}s oldin)" for s, v in feed_prices.items())
+    return web.Response(text=f"Zona bot ishlayapti ✅ ({len(zones)} ta faol zona)\nMT5 narxi: {feeds or 'kelmayapti'}")
 
 
 # ───────────────────────── ishga tushirish ─────────────────────────
@@ -753,6 +908,7 @@ def create_app():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_post("/webhook", webhook)
+    app.router.add_post("/price", price_feed)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
