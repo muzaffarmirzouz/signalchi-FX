@@ -30,6 +30,7 @@ import logging
 import math
 import re
 import time
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -82,6 +83,10 @@ offsets = {}         # /tuzat bilan: {"XAUUSD": [0.85, "Bitget"]} — Exness nar
 feed_prices = {}     # MT5'dan kelgan narxlar: {"XAUUSD": (vaqt, bid, ask)}
 FEED_MAX_AGE = float(os.environ.get("FEED_MAX_AGE", 60))
 last_source = {}     # {"XAUUSD": "MT5"} — manba almashganini logga yozish uchun
+# TradingView signalida BUY/SELL'ni aniqlash uchun oxirgi ~40 daqiqa narxlari
+price_history = {}   # {"XAUUSD": deque([(vaqt, narx), ...])}
+HISTORY_SYMBOLS = {"XAUUSD"}
+recent_tv = {}       # takroriy TradingView xabarlarini o'tkazib yuborish: {xabar: vaqt}
 
 
 # ───────────────────────── yordamchi funksiyalar ─────────────────────────
@@ -468,10 +473,42 @@ async def fetch_binance(symbols):
 
 # ───────────────────────── narx kuzatuvchi ─────────────────────────
 
+def remember_prices(prices: dict):
+    now = time.time()
+    for sym, p in prices.items():
+        h = price_history.setdefault(sym, deque(maxlen=300))
+        h.append((now, p))
+
+
+def detect_side(symbol: str, price: float, data: dict):
+    """Narx zonaga qayerdan kelganiga qarab: yuqoridan tushgan -> BUY, pastdan chiqqan -> SELL."""
+    h = price_history.get(symbol)
+    if h:
+        now = time.time()
+        # 3-15 daqiqa oldingi narxlar o'rtachasi bilan solishtiramiz
+        old = [p for t, p in h if 180 <= now - t <= 900]
+        if old:
+            ref = sum(old) / len(old)
+            if abs(price - ref) >= price * 0.00005:  # oltinda ~0.2$ dan katta farq
+                return "BUY" if price < ref else "SELL"
+    # zaxira: shamning ochilishi bilan yopilishini solishtirish
+    try:
+        o, c = float(data.get("open")), float(data.get("price"))
+        if c < o:
+            return "BUY"
+        if c > o:
+            return "SELL"
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 async def check_once():
+    wanted = [z["symbol"] for z in zones] + [t["symbol"] for t in trades] + list(HISTORY_SYMBOLS)
+    prices = await fetch_prices(wanted)
+    remember_prices(prices)
     if not zones and not trades:
         return
-    prices = await fetch_prices([z["symbol"] for z in zones] + [t["symbol"] for t in trades])
     fired, changed = [], False
     for z in zones:
         price = prices.get(z["symbol"])
@@ -832,6 +869,66 @@ def format_message(data) -> str:
     return "\n".join(lines)
 
 
+def tv_signal_text(z, price: float) -> str:
+    lines = [
+        side_header(z.get("side")),
+        "",
+        f"📈 Juftlik: <b>{esc(z['symbol'])}</b>",
+        f"💰 Narx: <b>{fmt(price)}</b>",
+    ]
+    if z.get("zona"):
+        lines.append(f"📍 Zona: <b>{esc(z['zona'])}</b>")
+    if z.get("note"):
+        lines.append(f"📝 {esc(z['note'])}")
+    return "\n".join(lines)
+
+
+async def handle_tv_signal(data: dict) -> str:
+    """TradingView signalini /buy, /sell dagi kabi qayta ishlaydi: signal + pips kuzatuvi."""
+    global next_id
+    ticker = str(data.get("ticker") or data.get("symbol") or "").split(":")[-1]
+    if not ticker:
+        await broadcast(format_message(data))
+        return "ticker yo'q, oddiy xabar yuborildi"
+    symbol = norm_symbol(ticker)
+
+    # Narx: botning o'z manbasi (Exness'ga moslangan) — pips shu bilan hisoblanadi
+    our = (await fetch_prices([symbol])).get(symbol)
+    try:
+        tv_price = float(data.get("price"))
+    except (TypeError, ValueError):
+        tv_price = None
+    price = our if our is not None else tv_price
+    if price is None:
+        await broadcast(format_message(data))
+        return "narx yo'q, oddiy xabar yuborildi"
+
+    sig = str(data.get("signal", "")).upper()
+    side = next((SIDE_WORDS[w] for w in re.findall(r"[A-Z]+", sig) if w in SIDE_WORDS), None)
+    auto = side is None
+    if auto:
+        side = detect_side(symbol, price, data)
+
+    # TradingView ba'zan aynan bir xabarni ikki marta yuboradi
+    key = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    now = time.time()
+    for k in [k for k, t in recent_tv.items() if now - t > 60]:
+        recent_tv.pop(k, None)
+    if key in recent_tv:
+        return "takroriy signal, o'tkazib yuborildi"
+    recent_tv[key] = now
+
+    z = {"id": next_id, "symbol": symbol, "side": side,
+         "zona": str(data.get("zona") or "").strip(), "note": str(data.get("izoh") or "").strip()[:200]}
+    next_id += 1
+    msg_ids = await broadcast(tv_signal_text(z, price))
+    tracked = our is not None and open_trade(z, price, msg_ids) is not None
+    save_zones()
+    log.info("TradingView signal #%s %s %s%s narx=%s kuzatuv=%s", z["id"], symbol, side,
+             " (avto)" if auto else "", price, tracked)
+    return "ok"
+
+
 async def webhook(request):
     raw = (await request.text()).strip()
     try:
@@ -850,9 +947,13 @@ async def webhook(request):
     if not data:
         return web.Response(status=400, text="bo'sh xabar")
 
-    log.info("TradingView signal: %s", raw[:300])
-    await broadcast(format_message(data))
-    return web.Response(text="ok")
+    log.info("TradingView xabari: %s", raw[:300])
+    if isinstance(data, dict):
+        result = await handle_tv_signal(data)
+    else:
+        await broadcast(format_message(data))
+        result = "ok"
+    return web.Response(text=result)
 
 
 async def price_feed(request):
@@ -915,4 +1016,4 @@ def create_app():
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="0.0.0.0", port=PORT)
+    web.run_app(create_app(), host="0.0.0.0", port=PORT, access_log=None)  # URL'dagi kalit logga tushmasin
