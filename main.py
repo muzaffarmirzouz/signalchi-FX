@@ -13,6 +13,9 @@ Railway Variables:
                     Berilmasa, CHAT_ID dagi shaxsiy (minus'siz) ID'lar admin bo'ladi.
   CHECK_INTERVAL  - (ixtiyoriy) narxni necha soniyada tekshirish, standart 10
   DATA_DIR        - (ixtiyoriy) zonalar saqlanadigan papka (Railway Volume, masalan /data)
+  PIP_TARGETS     - (ixtiyoriy) signaldan keyin qaysi pips'larda xabar berish, standart "50,100,150,200"
+  TRACK_HOURS     - (ixtiyoriy) signal necha soat kuzatiladi, standart 48
+  PIP_SIZES       - (ixtiyoriy) 1 pip qiymati, masalan "XAUUSD:0.1,BTCUSDT:1"
 """
 
 import os
@@ -20,6 +23,9 @@ import json
 import html
 import asyncio
 import logging
+import math
+import re
+import time
 from pathlib import Path
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -41,6 +47,14 @@ PRICE_API = os.environ.get("PRICE_API", "https://data-api.binance.vision/api/v3/
 METAL_API = os.environ.get("METAL_API", "https://api.gold-api.com/price")
 METAL_CACHE = float(os.environ.get("METAL_CACHE", 30))  # gold-api har ~30 soniyada yangilanadi
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+PIP_TARGETS = sorted({int(x) for x in os.environ.get("PIP_TARGETS", "50,100,150,200").split(",") if x.strip().isdigit()})
+TRACK_HOURS = float(os.environ.get("TRACK_HOURS", 48))
+# XAUUSD: 1 pip = 0.10$ (100 pips = 10$). XAGUSD: 1 pip = 0.01$.
+PIP_SIZES = {"XAUUSD": 0.1, "XAGUSD": 0.01}
+for _item in os.environ.get("PIP_SIZES", "").split(","):
+    if ":" in _item:
+        _k, _v = _item.split(":", 1)
+        PIP_SIZES[_k.strip().upper()] = float(_v)
 
 # Metallar gold-api.com'dan, qolganlari Binance'dan olinadi
 METALS = {"XAUUSD": "XAU", "XAGUSD": "XAG"}
@@ -50,7 +64,8 @@ ALIASES = {
 }
 
 http = None          # aiohttp ClientSession
-zones = []           # [{id, symbol, low, high, note, state}]
+zones = []           # [{id, symbol, low, high, note, state, side}]
+trades = []          # signal chiqqandan keyin kuzatilayotganlar
 next_id = 1
 tasks = []
 metal_cache = {}     # {"XAUUSD": (vaqt, narx)}
@@ -151,8 +166,91 @@ def signal_text(z, price: float, how: str) -> str:
     ]
     if z.get("note"):
         lines.append(f"📝 {esc(z['note'])}")
-    lines += ["", f"<i>#{z['id']} zona ro'yxatdan o'chirildi.</i>"]
     return "\n".join(lines)
+
+
+# ───────────────────────── signaldan keyingi kuzatuv (pips) ─────────────────────────
+
+def pip_size(symbol: str, price: float) -> float:
+    if symbol in PIP_SIZES:
+        return PIP_SIZES[symbol]
+    # kripto: narxning ~0.01% i atrofida (BTC 66000 -> 1, ETH 3400 -> 0.1)
+    return 10 ** (math.floor(math.log10(price)) - 4)
+
+
+def find_level(note: str, word: str):
+    m = re.search(rf"\b{word}\s*[:=]?\s*(\d+(?:[.,]\d+)?)", note or "", re.IGNORECASE)
+    return parse_num(m.group(1)) if m else None
+
+
+def pips_of(t, price: float) -> float:
+    d = (price - t["entry"]) if t["side"] == "BUY" else (t["entry"] - price)
+    return d / t["pip"]
+
+
+def fmt_pips(p: float) -> str:
+    return f"{'+' if p >= 0 else '−'}{abs(p):.0f}"
+
+
+def open_trade(z, price: float, msg_ids: dict):
+    side = z.get("side")
+    if side not in ("BUY", "SELL"):
+        return None
+    sl, tp = find_level(z.get("note"), "SL"), find_level(z.get("note"), "TP")
+    # noto'g'ri tomondagi SL/TP e'tiborga olinmaydi
+    if sl is not None and ((side == "BUY" and sl >= price) or (side == "SELL" and sl <= price)):
+        sl = None
+    if tp is not None and ((side == "BUY" and tp <= price) or (side == "SELL" and tp >= price)):
+        tp = None
+    t = {
+        "id": z["id"], "symbol": z["symbol"], "side": side, "entry": price,
+        "pip": pip_size(z["symbol"], price), "sl": sl, "tp": tp, "hit": [], "best": 0.0,
+        "opened": time.time(), "msgs": {str(k): v for k, v in msg_ids.items()},
+    }
+    trades.append(t)
+    return t
+
+
+def trade_head(t) -> str:
+    icon = "🟢" if t["side"] == "BUY" else "🔴"
+    return f"{icon} {esc(t['symbol'])} {t['side']} signal bo'yicha"
+
+
+def check_trade(t, price: float):
+    """(xabar yoki None, yopilsinmi) qaytaradi."""
+    move = pips_of(t, price)
+    t["best"] = max(t["best"], move)
+    line = f"Kirish: {fmt(t['entry'])} → Hozir: {fmt(price)}"
+
+    # 1) SL
+    if t["sl"] is not None and ((t["side"] == "BUY" and price <= t["sl"]) or (t["side"] == "SELL" and price >= t["sl"])):
+        sl_pips = pips_of(t, t["sl"])
+        text = [f"❌ <b>SL urildi ({fmt_pips(sl_pips)} pips)</b>", trade_head(t),
+                f"Kirish: {fmt(t['entry'])} → SL: {fmt(t['sl'])}"]
+        if t["best"] >= 1:
+            text.append(f"Eng yaxshi natija: {fmt_pips(t['best'])} pips")
+        return "\n".join(text), True
+
+    # 2) TP
+    if t["tp"] is not None and ((t["side"] == "BUY" and price >= t["tp"]) or (t["side"] == "SELL" and price <= t["tp"])):
+        tp_pips = pips_of(t, t["tp"])
+        return "\n".join([f"🏆 <b>TP urildi! {fmt_pips(tp_pips)} pips</b> 🔥", trade_head(t),
+                          f"Kirish: {fmt(t['entry'])} → TP: {fmt(t['tp'])}"]), True
+
+    # 3) pips maqsadlari (50, 100, ...)
+    new_hits = [p for p in PIP_TARGETS if p not in t["hit"] and move >= p]
+    if new_hits:
+        t["hit"].extend(new_hits)
+        top = max(new_hits)
+        last = t["tp"] is None and top >= PIP_TARGETS[-1]
+        title = f"🏁 <b>Signal yakunlandi: +{top} pips</b> 🔥" if last else f"✅ <b>+{top} pips</b> 🔥"
+        return "\n".join([title, trade_head(t), line]), last
+
+    # 4) vaqt tugadi
+    if time.time() - t["opened"] > TRACK_HOURS * 3600:
+        log.info("#%s kuzatuv vaqti tugadi (eng yaxshi %.0f pips)", t["id"], t["best"])
+        return None, True
+    return None, False
 
 
 # ───────────────────────── saqlash ─────────────────────────
@@ -162,7 +260,8 @@ def load_zones():
     try:
         data = json.loads(ZONES_FILE.read_text(encoding="utf-8"))
         zones, next_id = data.get("zones", []), data.get("next_id", 1)
-        log.info("%d ta zona yuklandi", len(zones))
+        trades[:] = data.get("trades", [])
+        log.info("%d ta zona, %d ta kuzatilayotgan signal yuklandi", len(zones), len(trades))
     except FileNotFoundError:
         zones, next_id = [], 1
     except Exception:
@@ -173,7 +272,7 @@ def load_zones():
 def save_zones():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = ZONES_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones}, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades}, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(ZONES_FILE)
 
 
@@ -191,13 +290,22 @@ async def tg(method: str, **payload):
         return {"ok": False}
 
 
-async def send(chat_id, text: str):
-    await tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+async def send(chat_id, text: str, reply_to=None):
+    payload = dict(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+    data = await tg("sendMessage", **payload)
+    return (data.get("result") or {}).get("message_id") if isinstance(data, dict) else None
 
 
-async def broadcast(text: str):
+async def broadcast(text: str, reply_to: dict = None):
+    """Hamma CHAT_ID ga yuboradi, {chat_id: message_id} qaytaradi."""
+    ids = {}
     for chat_id in CHAT_IDS:
-        await send(chat_id, text)
+        mid = await send(chat_id, text, reply_to=(reply_to or {}).get(str(chat_id)))
+        if mid:
+            ids[str(chat_id)] = mid
+    return ids
 
 
 async def fetch_metal(symbol: str):
@@ -269,9 +377,9 @@ async def fetch_binance(symbols):
 # ───────────────────────── narx kuzatuvchi ─────────────────────────
 
 async def check_once():
-    if not zones:
+    if not zones and not trades:
         return
-    prices = await fetch_prices(z["symbol"] for z in zones)
+    prices = await fetch_prices([z["symbol"] for z in zones] + [t["symbol"] for t in trades])
     fired, changed = [], False
     for z in zones:
         price = prices.get(z["symbol"])
@@ -285,11 +393,30 @@ async def check_once():
     if fired:
         ids = {z["id"] for z, _, _ in fired}
         zones[:] = [z for z in zones if z["id"] not in ids]
-    if changed or fired:
-        save_zones()
     for z, price, how in fired:
         log.info("Signal: #%s %s %s", z["id"], z["symbol"], price)
-        await broadcast(signal_text(z, price, how))
+        msg_ids = await broadcast(signal_text(z, price, how))
+        open_trade(z, price, msg_ids)
+
+    # ochiq signallarni kuzatish: +50, +100 pips, SL, TP
+    closed = set()
+    for t in list(trades):
+        price = prices.get(t["symbol"])
+        if price is None:
+            continue
+        before = (t["best"], len(t["hit"]))
+        text, done = check_trade(t, price)
+        if (t["best"], len(t["hit"])) != before:
+            changed = True
+        if text:
+            log.info("#%s: %s", t["id"], text.splitlines()[0])
+            await broadcast(text, reply_to=t.get("msgs"))
+        if done:
+            closed.add(t["id"])
+    if closed:
+        trades[:] = [t for t in trades if t["id"] not in closed]
+    if changed or fired or closed:
+        save_zones()
 
 
 async def price_loop():
@@ -310,17 +437,21 @@ HELP = (
     "<b>Zona qo'shish:</b>\n"
     "<code>/buy XAUUSD 4150 4160</code> — BUY zona (signal: DIQQAT BUY)\n"
     "<code>/sell XAUUSD 4250 4260</code> — SELL zona (signal: DIQQAT SELL)\n"
-    "<code>/buy XAUUSD 4150 SL 4140</code> — bitta daraja + izoh\n"
+    "<code>/buy XAUUSD 4150 4160 SL 4140 TP 4200</code> — SL/TP bilan\n"
     "<code>/zona XAUUSD 4150 4160</code> — yo'nalishni bot o'zi aniqlaydi:\n"
     "    zona narxdan pastda → BUY, yuqorida → SELL\n\n"
     "<b>Boshqa buyruqlar:</b>\n"
     "/zonalar — faol zonalar ro'yxati\n"
     "<code>/ochir 3</code> — 3-raqamli zonani o'chirish\n"
     "/tozala — hamma zonani o'chirish\n"
-    "<code>/narx XAUUSD</code> — hozirgi narx\n\n"
+    "<code>/narx XAUUSD</code> — hozirgi narx\n"
+    "/signallar — signal chiqqandan keyin necha pips yurgani\n"
+    "<code>/yopish 3</code> — signal kuzatuvini to'xtatish\n\n"
+    "<b>Signaldan keyin:</b> bot narxni kuzatadi va +50, +100 pips yurganda "
+    "signal postiga reply qilib yozadi. Izohda SL/TP bo'lsa, urilganini ham yozadi.\n\n"
     "Oltin: <code>XAUUSD</code> (yoki XAU, oltin, gold). Kumush: <code>XAGUSD</code>.\n"
     "Kripto: BTC, ETH va boshqalar (Binance).\n"
-    "Signal bir marta keladi, keyin zona avtomatik o'chiriladi.\n"
+    "XAUUSD'da 1 pip = 0.10$ (100 pips = 10$).\n"
     "TradingView alertlari ham avvalgidek ishlayveradi."
 )
 
@@ -429,6 +560,32 @@ async def cmd_narx(chat_id, args):
     await send(chat_id, f"💰 <b>{esc(symbol)}</b>: {fmt(p)}")
 
 
+async def cmd_signallar(chat_id, _):
+    if not trades:
+        return await send(chat_id, "Hozir kuzatilayotgan signal yo'q.")
+    prices = await fetch_prices(t["symbol"] for t in trades)
+    lines = [f"📊 <b>Kuzatilayotgan signallar ({len(trades)} ta)</b>", ""]
+    for t in trades:
+        p = prices.get(t["symbol"])
+        now = f" · hozir {fmt_pips(pips_of(t, p))} pips" if p is not None else ""
+        extra = "".join([f" · SL {fmt(t['sl'])}" if t["sl"] else "", f" · TP {fmt(t['tp'])}" if t["tp"] else ""])
+        icon = "🟢" if t["side"] == "BUY" else "🔴"
+        lines.append(f"<b>#{t['id']}</b> {icon} {esc(t['symbol'])} {t['side']} @ {fmt(t['entry'])}{now}{extra}")
+    lines.append("\nKuzatuvni to'xtatish: <code>/yopish raqam</code>")
+    await send(chat_id, "\n".join(lines))
+
+
+async def cmd_yopish(chat_id, args):
+    ids = {int(a.lstrip("#")) for a in args if a.lstrip("#").isdigit()}
+    if not ids:
+        return await send(chat_id, "Namuna: <code>/yopish 3</code>")
+    before = len(trades)
+    trades[:] = [t for t in trades if t["id"] not in ids]
+    save_zones()
+    n = before - len(trades)
+    await send(chat_id, f"⏹ {n} ta signal kuzatuvi to'xtatildi." if n else "Bunday raqamli signal topilmadi.")
+
+
 async def cmd_help(chat_id, _):
     await send(chat_id, HELP)
 
@@ -443,6 +600,8 @@ COMMANDS = {
     "/ochir": cmd_ochir,
     "/tozala": cmd_tozala,
     "/narx": cmd_narx,
+    "/signallar": cmd_signallar,
+    "/yopish": cmd_yopish,
 }
 
 
@@ -476,6 +635,8 @@ async def poll_loop():
         {"command": "ochir", "description": "Zonani o'chirish: /ochir 3"},
         {"command": "tozala", "description": "Hamma zonani o'chirish"},
         {"command": "narx", "description": "Hozirgi narx: /narx XAUUSD"},
+        {"command": "signallar", "description": "Kuzatilayotgan signallar (pips)"},
+        {"command": "yopish", "description": "Signal kuzatuvini to'xtatish: /yopish 3"},
         {"command": "help", "description": "Yordam"},
     ])
     offset = None
