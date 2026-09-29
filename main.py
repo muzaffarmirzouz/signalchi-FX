@@ -473,6 +473,13 @@ async def fetch_binance(symbols):
 
 # ───────────────────────── narx kuzatuvchi ─────────────────────────
 
+def shift_history(symbol: str, delta: float):
+    """/tuzat farqi o'zgarganda eslab qolingan narxlarni ham suramiz, aks holda yo'nalish xato aniqlanadi."""
+    h = price_history.get(symbol)
+    if h and delta:
+        price_history[symbol] = deque(((t, p + delta) for t, p in h), maxlen=h.maxlen)
+
+
 def remember_prices(prices: dict):
     now = time.time()
     for sym, p in prices.items():
@@ -730,6 +737,8 @@ async def cmd_tuzat(chat_id, args):
     if symbol not in METALS:
         return await send(chat_id, "Tuzatish faqat XAUUSD va XAGUSD uchun.")
     if args[1].lower() in ("off", "0", "reset", "ochir"):
+        c = metal_cache.get(symbol)
+        shift_history(symbol, -offset_for(symbol, c[2] if c else "Bitget"))
         offsets.pop(symbol, None)
         save_zones()
         return await send(chat_id, f"✅ {esc(symbol)} tuzatishi o'chirildi.")
@@ -743,6 +752,7 @@ async def cmd_tuzat(chat_id, args):
     off = exness - raw
     if abs(off) > raw * 0.01:
         return await send(chat_id, f"⚠️ Farq juda katta ({off:+.2f}). Narxni to'g'ri yozdingizmi? {esc(src)}: {fmt(raw)}")
+    shift_history(symbol, round(off, 3) - offset_for(symbol, src))
     offsets[symbol] = [round(off, 3), src]
     save_zones()
     await send(chat_id, "\n".join([
