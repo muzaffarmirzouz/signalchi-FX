@@ -240,3 +240,4 @@ Indikatori strelka chizadigan MT4 (yoki MT5) dan signalni botga yuborish: `mt4/Z
 4. `InpScan=true` bo'lsa ishga tushganda *Experts* jurnalida har bufer nechta qiymat berganini yozadi — strelka buferini shundan topasiz.
 - Faqat **yopilgan sham** (`InpShift=1`) o'qiladi. SL/TP = ATR × koeffitsiyent (bot o'z narxiga qo'yadi).
 - Hisobotda indikator signallari avto-signaldan **alohida** qatorda chiqadi (`📡 Indikator signallari`).
+- **💪 Kuchli signal** = BrainTrend strelkasi + `FL03` nuqtasi (oxirgi `InpConfWindow` shamda). Sozlamalar: `InpConfirm` (`FL03`, bo'sh = o'chirilgan), `InpConfBuyBuffer` (0 = ko'k nuqta), `InpConfSellBuffer` (1 = sariq nuqta), `InpOnlyStrong` (true = faqat kuchli signallar yuboriladi). Nuqtaning qaysi yo'nalishni bildirishi jurnaldagi "SKAN (tasdiq)" qatorlari va grafik bilan solishtirib tekshiriladi. Hisobotda "shundan kuchli" qatori alohida chiqadi.

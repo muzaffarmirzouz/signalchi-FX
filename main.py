@@ -275,6 +275,8 @@ def open_trade(z, price: float, msg_ids: dict):
         t["setup"], t["stars"] = z.get("setup"), z.get("stars")
     if z.get("src"):
         t["src"] = z["src"]
+    if z.get("strong"):
+        t["strong"] = True
     trades.append(t)
     return t
 
@@ -977,7 +979,7 @@ def record_history(t):
     sl_pips = abs(t["entry"] - t["sl"]) / t["pip"] if t.get("sl") is not None else None
     history.append({
         "id": t["id"], "symbol": t["symbol"], "side": t["side"], "auto": bool(t.get("auto")),
-        "src": t.get("src"), "setup": t.get("setup"), "stars": t.get("stars"), "entry": t["entry"], "exit": exit_px,
+        "src": t.get("src"), "strong": bool(t.get("strong")), "setup": t.get("setup"), "stars": t.get("stars"), "entry": t["entry"], "exit": exit_px,
         "result": t.get("result", "?"), "pips": round(pips, 1),
         "r": round(pips / sl_pips, 2) if sl_pips else None, "opened": t["opened"], "closed": time.time(),
     })
@@ -1016,6 +1018,8 @@ def report_text(entries, title: str, live=None) -> str:
         lines.append(f"⏳ Kirish narxiga yetmay bekor bo'lgan: {a['nofill']} ta")
     if a["indi"]["n"]:
         lines.append(f"📡 Indikator signallari: {_row(a['indi'])} · {a['indi_r']:+.1f}R")
+        if a["indi_strong"]["n"]:
+            lines.append(f"   💪 shundan kuchli: {_row(a['indi_strong'])} · {a['indi_strong_r']:+.1f}R")
     if a["manual"]["n"]:
         lines.append(f"✍️ Qo'lda/zona signallar: {a['manual']['n']} ta · {fmt_pips(a['manual']['pips'])} pips")
     if live is not None:
@@ -1534,6 +1538,7 @@ async def handle_indi_signal(data: dict) -> str:
     except (KeyError, TypeError, ValueError):
         return "xato: sl_dist/tp_dist kerak (musbat son)"
     name = str(data.get("name") or "indikator")[:40]
+    strong = data.get("strong") in (True, 1, "1", "true", "True")
     key = f"indi|{symbol}|{side}|{data.get('bar', '')}"
     now = time.time()
     for k in [k for k, t in recent_tv.items() if now - t > 600]:
@@ -1551,7 +1556,7 @@ async def handle_indi_signal(data: dict) -> str:
     ps = pip_size(symbol, price)
     text = "\n".join([
         side_header(side),
-        "📡 Indikator signali: <b>" + esc(name) + "</b>" + (" · 🧪 <b>TEST rejimi</b>" if auto["mode"] != "kanal" else ""),
+        ("💪 <b>KUCHLI signal</b> (strelka + nuqta)\n" if strong else "") + "📡 Indikator signali: <b>" + esc(name) + "</b>" + (" · 🧪 <b>TEST rejimi</b>" if auto["mode"] != "kanal" else ""),
         "",
         f"📈 Juftlik: <b>{esc(symbol)}</b>",
         f"💰 Kirish: <b>{fmt(price)}</b>",
@@ -1562,7 +1567,7 @@ async def handle_indi_signal(data: dict) -> str:
     msg_ids = await broadcast(text, chats=targets)
     if not msg_ids:
         return "yuboriladigan chat yo'q"
-    z = {"id": next_id, "symbol": symbol, "side": side, "sl": sl, "tp": tp, "src": "indikator"}
+    z = {"id": next_id, "symbol": symbol, "side": side, "sl": sl, "tp": tp, "src": "indikator", "strong": strong}
     next_id += 1
     open_trade(z, price, msg_ids)
     save_zones()
