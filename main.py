@@ -273,6 +273,8 @@ def open_trade(z, price: float, msg_ids: dict):
     if z.get("auto"):
         t["auto"] = True
         t["setup"], t["stars"] = z.get("setup"), z.get("stars")
+    if z.get("src"):
+        t["src"] = z["src"]
     trades.append(t)
     return t
 
@@ -975,7 +977,7 @@ def record_history(t):
     sl_pips = abs(t["entry"] - t["sl"]) / t["pip"] if t.get("sl") is not None else None
     history.append({
         "id": t["id"], "symbol": t["symbol"], "side": t["side"], "auto": bool(t.get("auto")),
-        "setup": t.get("setup"), "stars": t.get("stars"), "entry": t["entry"], "exit": exit_px,
+        "src": t.get("src"), "setup": t.get("setup"), "stars": t.get("stars"), "entry": t["entry"], "exit": exit_px,
         "result": t.get("result", "?"), "pips": round(pips, 1),
         "r": round(pips / sl_pips, 2) if sl_pips else None, "opened": t["opened"], "closed": time.time(),
     })
@@ -1012,6 +1014,8 @@ def report_text(entries, title: str, live=None) -> str:
             lines.append(f"💔 Eng yomoni: {esc(worst['symbol'])} {worst['side']} {fmt_pips(worst['pips'])} pips")
     if a["nofill"]:
         lines.append(f"⏳ Kirish narxiga yetmay bekor bo'lgan: {a['nofill']} ta")
+    if a["indi"]["n"]:
+        lines.append(f"📡 Indikator signallari: {_row(a['indi'])} · {a['indi_r']:+.1f}R")
     if a["manual"]["n"]:
         lines.append(f"✍️ Qo'lda/zona signallar: {a['manual']['n']} ta · {fmt_pips(a['manual']['pips'])} pips")
     if live is not None:
@@ -1515,6 +1519,69 @@ async def handle_tv_signal(data: dict) -> str:
     return "ok"
 
 
+async def handle_indi_signal(data: dict) -> str:
+    """MT4/MT5 indikatoridan (EA orqali) kelgan signal: {"symbol","side","name","sl_dist","tp_dist"}.
+    SL/TP masofasi (narx birligida) botning o'z narxiga qo'yiladi. Statistika avto-signaldan alohida."""
+    global next_id
+    symbol = norm_symbol(str(data.get("symbol", "")))
+    side = str(data.get("side", "")).upper()
+    if not symbol or side not in ("BUY", "SELL"):
+        return "xato: symbol/side noto'g'ri"
+    try:
+        sl_d, tp_d = float(data["sl_dist"]), float(data["tp_dist"])
+        if sl_d <= 0 or tp_d <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return "xato: sl_dist/tp_dist kerak (musbat son)"
+    name = str(data.get("name") or "indikator")[:40]
+    key = f"indi|{symbol}|{side}|{data.get('bar', '')}"
+    now = time.time()
+    for k in [k for k, t in recent_tv.items() if now - t > 600]:
+        recent_tv.pop(k, None)
+    if key in recent_tv:
+        return "takroriy signal, o'tkazib yuborildi"
+    recent_tv[key] = now
+    if any(x["symbol"] == symbol and x["side"] == side and x.get("src") == "indikator" for x in trades):
+        return "shu yo'nalishda indikator signali hali ochiq"
+    price = (await fetch_prices([symbol])).get(symbol)
+    if price is None:
+        return "narx yo'q"
+    sl, tp = strategy.levels(side, price, sl_d, tp_d)
+    targets = auto_targets() or test_targets()
+    ps = pip_size(symbol, price)
+    text = "\n".join([
+        side_header(side),
+        "📡 Indikator signali: <b>" + esc(name) + "</b>" + (" · 🧪 <b>TEST rejimi</b>" if auto["mode"] != "kanal" else ""),
+        "",
+        f"📈 Juftlik: <b>{esc(symbol)}</b>",
+        f"💰 Kirish: <b>{fmt(price)}</b>",
+        *_rr_lines(symbol, price, sl, tp, sl_d, tp_d),
+        "",
+        AUTO_DISCLAIMER,
+    ])
+    msg_ids = await broadcast(text, chats=targets)
+    if not msg_ids:
+        return "yuboriladigan chat yo'q"
+    z = {"id": next_id, "symbol": symbol, "side": side, "sl": sl, "tp": tp, "src": "indikator"}
+    next_id += 1
+    open_trade(z, price, msg_ids)
+    save_zones()
+    log.info("Indikator signal #%s %s %s (%s) narx=%s SL=%s TP=%s", z["id"], symbol, side, name, price, round(sl, 2), round(tp, 2))
+    return "ok"
+
+
+async def indi_feed(request):
+    if SECRET and request.query.get("key", "") != SECRET:
+        return web.Response(status=403, text="forbidden")
+    try:
+        data = json.loads((await request.text()).strip().strip("\x00"))
+        if not isinstance(data, dict):
+            raise ValueError("JSON obyekt kerak")
+    except Exception as e:
+        return web.Response(status=400, text=f"xato: {e}")
+    return web.Response(text=await handle_indi_signal(data))
+
+
 async def webhook(request):
     raw = (await request.text()).strip()
     try:
@@ -1599,6 +1666,7 @@ def create_app():
     app.router.add_get("/", health)
     app.router.add_post("/webhook", webhook)
     app.router.add_post("/price", price_feed)
+    app.router.add_post("/indi", indi_feed)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

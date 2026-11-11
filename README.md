@@ -229,3 +229,14 @@ Yopilgan signallar: 10 ta → ✅ TP: 5 · ❌ SL: 5
 
 > ⚠️ **Muhim:** natijalar `zones.json`, hisobot belgisi `auto_state.json` da saqlanadi. Railway'da **Volume** ulab
 > `DATA_DIR=/data` qo'ymasangiz, har qayta deploy/restartda tarix o'chadi va hisobot to'liq bo'lmaydi.
+
+## 📡 MT4/MT5 indikatoridan signal (`/indi`)
+
+Indikatori strelka chizadigan MT4 (yoki MT5) dan signalni botga yuborish: `mt4/ZonaIndiFeed.mq4` (MQL4; MT5 uchun `iCustom`/`CopyBuffer` ga moslash kerak).
+
+1. Faylni MT4: *File → Open Data Folder → MQL4 → Experts* ga qo'ying, MetaEditor'da **Compile**.
+2. *Tools → Options → Expert Advisors*: **Allow WebRequest** va Railway domeningizni qo'shing.
+3. EA'ni signal chizadigan grafikka (masalan XAUUSD M15) tashlang. Parametrlar: `InpUrl` (`.../indi?key=WEBHOOK_SECRET`), `InpIndicator` (indikator nomi), `InpBuyBuffer`/`InpSellBuffer`.
+4. `InpScan=true` bo'lsa ishga tushganda *Experts* jurnalida har bufer nechta qiymat berganini yozadi — strelka buferini shundan topasiz.
+- Faqat **yopilgan sham** (`InpShift=1`) o'qiladi. SL/TP = ATR × koeffitsiyent (bot o'z narxiga qo'yadi).
+- Hisobotda indikator signallari avto-signaldan **alohida** qatorda chiqadi (`📡 Indikator signallari`).

@@ -41,13 +41,14 @@ def aggregate(entries, auto_only=True):
     """Yopilgan signallar statistikasi. auto_only=True: asosiy statistika faqat avto-signallar;
     qo'lda/zona/TradingView signallar `manual` bo'limida alohida."""
     auto = [e for e in entries if e.get("auto") and e.get("result") != "NOFILL"]
-    manual = [e for e in entries if not e.get("auto") and e.get("result") != "NOFILL"]
+    indi = [e for e in entries if e.get("src") == "indikator" and e.get("result") != "NOFILL"]
+    manual = [e for e in entries if not e.get("auto") and e.get("src") != "indikator" and e.get("result") != "NOFILL"]
     main_set = auto if auto_only else auto + manual
     out = {
         "total": _bucket(), "side": {"BUY": _bucket(), "SELL": _bucket()}, "symbol": {},
         "r_total": 0.0, "best": None, "worst": None,
         "nofill": sum(1 for e in entries if e.get("auto") and e.get("result") == "NOFILL"),
-        "manual": _bucket(),
+        "manual": _bucket(), "indi": _bucket(), "indi_r": 0.0,
     }
     for e in main_set:
         _add(out["total"], e)
@@ -60,6 +61,9 @@ def aggregate(entries, auto_only=True):
         out["worst"] = min(main_set, key=lambda e: e.get("pips") or 0.0)
     for e in manual:
         _add(out["manual"], e)
+    for e in indi:
+        _add(out["indi"], e)
+        out["indi_r"] += e.get("r") or 0.0
     n = out["total"]["n"]
     out["win_rate"] = out["total"]["tp"] / n if n else None
     return out
