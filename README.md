@@ -128,3 +128,28 @@ python3 tests/test_strategy.py
 > ⚠️ Bu qoidalar foyda kafolatlamaydi. Kanalga ochishdan oldin kamida 1–2 hafta test rejimida
 > signallarni kuzating (`/signallar` va TP/SL natijalari) va kerak bo'lsa `AUTO_MIN_STARS` ni oshiring.
 > Bu moliyaviy maslahat emas.
+
+---
+
+## 📈 Backtest (strategiyani o'tmishda sinash)
+
+Kanalga ochishdan **oldin** shuni ishga tushiring: avto-signal qoidalari o'tgan kunlarda qancha ishlaganini ko'rsatadi.
+Faqat Python (aiohttp kerak emas), o'z kompyuteringizda ishlaydi.
+
+```bash
+python3 backtest.py --symbol XAUUSD --days 30
+python3 backtest.py --symbol BTCUSDT --days 60
+python3 backtest.py --symbol XAUUSD --csv exness_xauusd_m15.csv   # MT5'dan eksport (eng aniq: Exness narxi)
+python3 backtest.py --symbol XAUUSD --days 30 --min-stars 3 --cost-r 0.05
+```
+
+- Jonli bot bilan **bir xil qoidalar**: tanaffus, kunlik limit, "shu yo'nalishda ochiq signal bor" holati.
+- Natija **R** birligida: SL = −1R, TP = +1.67R (breakout) / +1.33R (qaytish). `--cost-r` spred/slippage uchun.
+- Bir shamda ham SL, ham TP ga tegsa — **SL birinchi** deb olinadi (konservativ).
+- Hisobot: umumiy, BUY/SELL, breakout/qaytish bo'yicha va **kuch (⭐) bo'yicha** — `AUTO_MIN_STARS` ni shundan tanlang.
+- MT5'da shamlarni eksport qilish: *Tools → History Center* (M15 → Export) yoki grafikdan "Save as CSV".
+- `python3 tests/test_backtest.py` — testlar.
+
+**Natijani qanday o'qish:** `o'rtacha R > 0` va `PF > 1.2` bo'lsa va savdolar soni ≥ 30–50 bo'lsa, qoida o'sha davrda
+ishlagan. Aks holda (ayniqsa `o'rtacha ≤ 0`) kanalga ochmang. O'tmishdagi natija kelajakni kafolatlamaydi,
+va Bitget oltin narxi Exness'dan biroz farq qiladi.
