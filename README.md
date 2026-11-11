@@ -171,3 +171,28 @@ python3 backtest.py --symbol XAUUSD --days 30 --entry market --pullback 0.3 --pe
 **Natijani qanday o'qish:** `o'rtacha R > 0` va `PF > 1.2` bo'lsa va savdolar soni ≥ 30–50 bo'lsa, qoida o'sha davrda
 ishlagan. Aks holda (ayniqsa `o'rtacha ≤ 0`) kanalga ochmang. O'tmishdagi natija kelajakni kafolatlamaydi,
 va Bitget oltin narxi Exness'dan biroz farq qiladi.
+
+---
+
+## 🔌 MT5 (Exness) narxini botga ulash — narx 1:1
+
+Bot narxni odatda Bitget/Binance'dan oladi, ular Exness'dan 2–5$ farq qilishi mumkin (oltinda). `mt5/ZonaPriceFeed.mq5`
+EA'si MT5'dagi **Exness Bid/Ask** narxini botga har 3 soniyada yuboradi. Ulangach bot **hamma narxni** (signal kirishi,
+pips, SL/TP, zonalar) to'g'ridan-to'g'ri Exness'dan oladi — `/tuzat` kerak emas. EA **savdo qilmaydi**, faqat narxni yuboradi.
+
+**O'rnatish (kompyuterdagi MT5, telefon emas):**
+
+1. Railway'da `WEBHOOK_SECRET` qiymatini va domeningizni (`https://....up.railway.app`) toping.
+2. MT5: **File → Open Data Folder → MQL5 → Experts** ga `mt5/ZonaPriceFeed.mq5` ni nusxalang. **MetaEditor** (F4) da oching → **Compile** (F7), xatosiz bo'lsin.
+3. MT5: **Tools → Options → Expert Advisors** → *Allow WebRequest for listed URL* ni belgilang va `https://SIZNING-APP.up.railway.app` ni qo'shing (faqat domen, `/price` siz).
+4. **Navigator → Expert Advisors → ZonaPriceFeed** ni istalgan grafikka (masalan XAUUSD) sudrab tashlang. **Inputs** da:
+   - `InpUrl` = `https://SIZNING-APP.up.railway.app/price?key=WEBHOOK_SECRET`
+   - `InpSymbols` = `XAUUSD:XAUUSD,BTCUSD:BTCUSDT` (`BrokerNomi:BotNomi`; broker nomi Market Watch'dagi bilan bir xil bo'lsin, ba'zan `XAUUSDm`)
+   - **Common** → *Allow Algo Trading*; yuqoridagi **Algo Trading** tugmasi yashil bo'lsin.
+5. Botga `/mt5` yozing: `🟢 XAUUSD: Bid ... · 3s oldin` va boshqa manba bilan farq ko'rinsa — ulandi.
+
+**Bilib qo'ying:**
+- EA faqat **kompyuter/VPS dagi MT5** da ishlaydi (telefondagi MT5 EA ishga tushirmaydi). MT5 yoqiq turishi kerak.
+- MT5 o'chsa yoki bozor yopiq bo'lsa, 60 soniyadan keyin bot avtomatik Bitget/Binance (+`/tuzat`) ga qaytadi, EA eski tickni yubormaydi.
+- Signal **shamlari** (breakout/RSI hisobi) hozircha Bitget/Binance'dan; **narxlar** (kirish, pips, SL/TP) MT5'dan.
+- Xato bo'lsa MT5 *Experts* jurnalida sabab yoziladi: `URL ruxsat etilmagan` (3-qadam), `403` (key noto'g'ri).
