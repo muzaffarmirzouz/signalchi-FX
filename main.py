@@ -18,6 +18,16 @@ Railway Variables:
   PIP_SIZES       - (ixtiyoriy) 1 pip qiymati, masalan "XAUUSD:0.1,BTCUSDT:1"
   FEED_MAX_AGE    - (ixtiyoriy) MT5 narxi necha soniyagacha yangi hisoblanadi, standart 60
 
+Avto-signal (strategy.py) — bot oltin va bitcoin shamlarini o'zi tahlil qilib signal beradi:
+  AUTO_MODE       - "test" (standart: signal faqat adminga) | "kanal" (CHAT_ID ga) | "off"
+  AUTO_SYMBOLS    - kuzatiladigan juftliklar, standart "XAUUSD,BTCUSDT"
+  AUTO_TF         - sham taymfreymi: 5m, 15m (standart), 30m, 1h
+  AUTO_MIN_STARS  - eng kam signal kuchi (1-4), standart 2
+  AUTO_COOLDOWN_MIN - bir juftlik+yo'nalishda signallar orasidagi tanaffus, standart 60
+  AUTO_MAX_PER_DAY  - bir juftlikka kuniga eng ko'p signal, standart 5
+  AUTO_TEST_CHAT  - (ixtiyoriy) test signallari boradigan ID; bo'lmasa ADMIN_ID
+Rejimni Telegram'dan o'zgartirish: /avto test | /avto kanal | /avto off
+
 MT5 (Exness) narxi: MT5'dagi ZonaPriceFeed EA har 3 soniyada /price ga narx yuboradi.
 Yangi MT5 narxi bo'lsa, bot shuni ishlatadi, bo'lmasa Bitget / gold-api / Binance'ga o'tadi.
 """
@@ -34,6 +44,8 @@ from collections import deque
 from pathlib import Path
 
 from aiohttp import web, ClientSession, ClientTimeout
+
+import strategy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zona-bot")
@@ -65,6 +77,23 @@ for _item in os.environ.get("PIP_SIZES", "").split(","):
     if ":" in _item:
         _k, _v = _item.split(":", 1)
         PIP_SIZES[_k.strip().upper()] = float(_v)
+
+# ── avto-signal sozlamalari ──
+AUTO_FILE = DATA_DIR / "auto_state.json"
+AUTO_SYMBOLS = [s for s in (x.strip().upper() for x in os.environ.get("AUTO_SYMBOLS", "XAUUSD,BTCUSDT").split(",")) if s]
+AUTO_TF = os.environ.get("AUTO_TF", "15m").strip().lower()
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+if AUTO_TF not in TF_SECONDS:
+    AUTO_TF = "15m"
+AUTO_INTERVAL = float(os.environ.get("AUTO_INTERVAL", 60))
+AUTO_COOLDOWN = float(os.environ.get("AUTO_COOLDOWN_MIN", 60)) * 60
+AUTO_MAX_PER_DAY = int(os.environ.get("AUTO_MAX_PER_DAY", 5))
+AUTO_MIN_STARS = int(os.environ.get("AUTO_MIN_STARS", 2))
+AUTO_TEST_CHATS = [c.strip() for c in os.environ.get("AUTO_TEST_CHAT", "").split(",") if c.strip()]
+KLINES_API = os.environ.get("KLINES_API", "https://data-api.binance.vision/api/v3/klines")
+BITGET_CANDLES_API = os.environ.get("BITGET_CANDLES_API", "https://api.bitget.com/api/v2/mix/market/candles")
+BITGET_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H"}
+AUTO_DISCLAIMER = "⚠️ Bu moliyaviy maslahat emas. Risk — o'zingizda, SL'siz savdo qilmang."
 
 # Metallar Bitget (zaxira: gold-api.com) dan, qolganlari Binance'dan olinadi
 METALS = {"XAUUSD": "XAU", "XAGUSD": "XAG"}
@@ -214,7 +243,8 @@ def open_trade(z, price: float, msg_ids: dict):
     side = z.get("side")
     if side not in ("BUY", "SELL"):
         return None
-    sl, tp = find_level(z.get("note"), "SL"), find_level(z.get("note"), "TP")
+    sl = z["sl"] if z.get("sl") is not None else find_level(z.get("note"), "SL")
+    tp = z["tp"] if z.get("tp") is not None else find_level(z.get("note"), "TP")
     # noto'g'ri tomondagi SL/TP e'tiborga olinmaydi
     if sl is not None and ((side == "BUY" and sl >= price) or (side == "SELL" and sl <= price)):
         sl = None
@@ -224,7 +254,10 @@ def open_trade(z, price: float, msg_ids: dict):
         "id": z["id"], "symbol": z["symbol"], "side": side, "entry": price,
         "pip": pip_size(z["symbol"], price), "sl": sl, "tp": tp, "hit": [], "best": 0.0,
         "opened": time.time(), "msgs": {str(k): v for k, v in msg_ids.items()},
+        "chats": [str(k) for k in msg_ids],  # kuzatuv xabarlari faqat signal borgan chatlarga boradi
     }
+    if z.get("auto"):
+        t["auto"] = True
     trades.append(t)
     return t
 
@@ -318,10 +351,10 @@ async def send(chat_id, text: str, reply_to=None):
     return (data.get("result") or {}).get("message_id") if isinstance(data, dict) else None
 
 
-async def broadcast(text: str, reply_to: dict = None):
-    """Hamma CHAT_ID ga yuboradi, {chat_id: message_id} qaytaradi."""
+async def broadcast(text: str, reply_to: dict = None, chats=None):
+    """Hamma CHAT_ID ga (yoki berilgan `chats` ga) yuboradi, {chat_id: message_id} qaytaradi."""
     ids = {}
-    for chat_id in CHAT_IDS:
+    for chat_id in (chats or CHAT_IDS):
         mid = await send(chat_id, text, reply_to=(reply_to or {}).get(str(chat_id)))
         if mid:
             ids[str(chat_id)] = mid
@@ -546,7 +579,7 @@ async def check_once():
             changed = True
         if text:
             log.info("#%s: %s", t["id"], text.splitlines()[0])
-            await broadcast(text, reply_to=t.get("msgs"))
+            await broadcast(text, reply_to=t.get("msgs"), chats=t.get("chats"))
         if done:
             closed.add(t["id"])
     if closed:
@@ -564,6 +597,230 @@ async def price_loop():
         except Exception:
             log.exception("Narx tekshiruvida xato")
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ───────────────────────── avto-signal (oltin + bitcoin) ─────────────────────────
+
+PARAMS = strategy.Params(min_stars=AUTO_MIN_STARS)
+auto = {"mode": os.environ.get("AUTO_MODE", "test").strip().lower(), "last_bar": {}, "last_sig": {}, "day": "", "count": {}}
+if auto["mode"] not in ("test", "kanal", "off"):
+    auto["mode"] = "test"
+
+
+def auto_load():
+    try:
+        data = json.loads(AUTO_FILE.read_text(encoding="utf-8"))
+        if data.get("mode") in ("test", "kanal", "off"):
+            auto["mode"] = data["mode"]
+        for k in ("last_bar", "last_sig", "count"):
+            if isinstance(data.get(k), dict):
+                auto[k] = data[k]
+        auto["day"] = data.get("day", "")
+        log.info("Avto-signal holati yuklandi: rejim=%s", auto["mode"])
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception("auto_state.json o'qib bo'lmadi, standart holat")
+
+
+def auto_save():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = AUTO_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(auto, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(AUTO_FILE)
+
+
+def test_targets():
+    return AUTO_TEST_CHATS or sorted(a for a in ADMIN_IDS if not a.startswith("-"))
+
+
+def auto_targets():
+    if auto["mode"] == "kanal":
+        return list(CHAT_IDS)
+    if auto["mode"] == "test":
+        return test_targets()
+    return []
+
+
+async def fetch_candles(symbol: str, tf: str = None, limit: int = 200):
+    """Yopilgan shamlar, eskidan yangiga. Oltin/kumush — Bitget, qolganlari — Binance."""
+    tf = tf or AUTO_TF
+    step = TF_SECONDS[tf]
+    rows = []
+    if symbol in BITGET_SYMBOLS:
+        params = {"symbol": BITGET_SYMBOLS[symbol], "productType": "USDT-FUTURES",
+                  "granularity": BITGET_TF[tf], "limit": str(limit)}
+        async with http.get(BITGET_CANDLES_API, params=params) as r:
+            data = await r.json()
+        if str(data.get("code")) != "00000" or not data.get("data"):
+            raise ValueError(f"Bitget sham javobi: {str(data)[:200]}")
+        for k in data["data"]:
+            rows.append({"t": int(k[0]) // 1000, "o": float(k[1]), "h": float(k[2]),
+                         "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
+    else:
+        async with http.get(KLINES_API, params={"symbol": symbol, "interval": tf, "limit": limit}) as r:
+            if r.status != 200:
+                raise ValueError(f"Binance klines {r.status}: {(await r.text())[:200]}")
+            data = await r.json()
+        for k in data:
+            rows.append({"t": int(k[0]) // 1000, "o": float(k[1]), "h": float(k[2]),
+                         "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
+    rows.sort(key=lambda c: c["t"])
+    now = time.time()
+    return [c for c in rows if c["t"] + step <= now + 2]  # hali shakllanayotgan shamni tashlaymiz
+
+
+def auto_signal_text(symbol, price, sig, sl, tp, test: bool) -> str:
+    ps = pip_size(symbol, price)
+    rr = sig["tp_dist"] / sig["sl_dist"]
+    setup = {"breakout": "Breakout (yorib o'tish)", "reversal": "RSI qaytishi"}.get(sig["setup"], sig["setup"])
+    lines = [
+        side_header(sig["side"]),
+        "🤖 Avto-signal" + (" · 🧪 <b>TEST rejimi</b>" if test else ""),
+        "",
+        f"📈 Juftlik: <b>{esc(symbol)}</b> · {AUTO_TF}",
+        f"💰 Kirish: <b>{fmt(price)}</b>",
+        f"🛑 SL: <b>{fmt(sl)}</b> ({fmt_pips(-sig['sl_dist'] / ps)} pips)",
+        f"🎯 TP: <b>{fmt(tp)}</b> ({fmt_pips(sig['tp_dist'] / ps)} pips)",
+        f"⚖️ Risk : Foyda = 1 : {rr:.2f}",
+        f"📊 Setap: {setup} · Kuch: {strategy.stars_text(sig['stars'])}",
+        f"📝 {esc(sig['reason'])}",
+        "",
+        AUTO_DISCLAIMER,
+    ]
+    return "\n".join(lines)
+
+
+async def auto_check_once():
+    global next_id
+    if auto["mode"] == "off":
+        return
+    targets = auto_targets()
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if auto["day"] != today:
+        auto["day"], auto["count"] = today, {}
+    changed = False
+    for sym in AUTO_SYMBOLS:
+        try:
+            res = strategy.analyze(await fetch_candles(sym), PARAMS)
+        except Exception as e:
+            log.warning("Avto-signal: %s shamlari olinmadi: %s", sym, e)
+            continue
+        if not res.get("ok") or auto["last_bar"].get(sym) == res["t"]:
+            continue  # ma'lumot yetarli emas yoki bu shamni allaqachon ko'rganmiz
+        auto["last_bar"][sym] = res["t"]
+        changed = True
+        sig = res["signal"]
+        if not sig:
+            continue
+        step = TF_SECONDS[AUTO_TF]
+        if time.time() - (res["t"] + step) > step:
+            log.info("Avto-signal: %s eski sham (%s), o'tkazib yuborildi", sym, sig["side"])
+            continue
+        key = f"{sym}|{sig['side']}"
+        if time.time() - auto["last_sig"].get(key, 0) < AUTO_COOLDOWN:
+            log.info("Avto-signal: %s tanaffusda, o'tkazib yuborildi", key)
+            continue
+        if auto["count"].get(sym, 0) >= AUTO_MAX_PER_DAY:
+            log.info("Avto-signal: %s bugungi limit tugadi", sym)
+            continue
+        if any(t["symbol"] == sym and t["side"] == sig["side"] for t in trades):
+            log.info("Avto-signal: %s uchun shu yo'nalishda signal hali ochiq", key)
+            continue
+        if not targets:
+            log.warning("Avto-signal: %s signal bor, lekin yuboriladigan chat yo'q (rejim=%s)", key, auto["mode"])
+            continue
+        price = (await fetch_prices([sym])).get(sym) or res["price"]
+        sl, tp = strategy.levels(sig["side"], price, sig["sl_dist"], sig["tp_dist"])
+        z = {"id": next_id, "symbol": sym, "side": sig["side"], "sl": sl, "tp": tp, "auto": True}
+        msg_ids = await broadcast(auto_signal_text(sym, price, sig, sl, tp, auto["mode"] == "test"), chats=targets)
+        if not msg_ids:
+            continue
+        open_trade(z, price, msg_ids)
+        next_id += 1
+        auto["last_sig"][key] = time.time()
+        auto["count"][sym] = auto["count"].get(sym, 0) + 1
+        log.info("Avto-signal #%s %s %s narx=%s SL=%s TP=%s kuch=%s rejim=%s", z["id"], sym, sig["side"],
+                 price, round(sl, 2), round(tp, 2), sig["stars"], auto["mode"])
+        save_zones()
+    if changed:
+        auto_save()
+
+
+async def auto_loop():
+    await asyncio.sleep(5)  # birinchi narxlar kelib olsin
+    while True:
+        try:
+            await auto_check_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Avto-signal siklida xato")
+        await asyncio.sleep(AUTO_INTERVAL)
+
+
+async def cmd_avto(chat_id, args):
+    mode = (args[0].lower() if args else "")
+    if mode in ("test", "kanal", "off"):
+        if mode == "kanal" and not CHAT_IDS:
+            return await send(chat_id, "❌ CHAT_ID berilmagan, kanalga yuborib bo'lmaydi.")
+        auto["mode"] = mode
+        auto_save()
+    elif mode:
+        return await send(chat_id, "Namuna: <code>/avto test</code>, <code>/avto kanal</code> yoki <code>/avto off</code>")
+    names = {"test": "🧪 TEST — signal faqat adminga", "kanal": "📢 KANAL — signal CHAT_ID dagi hammaga",
+             "off": "⏸ O'CHIQ"}
+    tg_list = auto_targets()
+    now = time.time()
+    bars = []
+    for s in AUTO_SYMBOLS:
+        t = auto["last_bar"].get(s)
+        bars.append(f"{esc(s)}: " + (f"{(now - t) / 60:.0f} daq oldingi sham" if t else "hali tekshirilmagan"))
+    lines = [
+        f"🤖 <b>Avto-signal</b>: {names[auto['mode']]}",
+        f"📈 Kuzatiladi: {esc(', '.join(AUTO_SYMBOLS))} · {AUTO_TF}",
+        f"⭐ Eng kam kuch: {AUTO_MIN_STARS} · tanaffus {AUTO_COOLDOWN / 60:.0f} daq · kuniga ≤ {AUTO_MAX_PER_DAY}/juftlik",
+        f"📬 Qabul qiluvchilar: {esc(', '.join(tg_list)) if tg_list else 'yo‘q'}",
+        f"📊 Bugun: {esc(', '.join(f'{k} {v}' for k, v in auto['count'].items()) or 'signal bo‘lmadi')}",
+        "🕒 " + "; ".join(bars),
+        "",
+        "<code>/avto test</code> · <code>/avto kanal</code> · <code>/avto off</code> · <code>/tahlil</code>",
+    ]
+    await send(chat_id, "\n".join(lines))
+
+
+async def cmd_tahlil(chat_id, args):
+    """Hozirgi bozor holati — signal bo'lmasa ham sababini ko'rsatadi (test uchun)."""
+    symbols = [norm_symbol(a) for a in args] or AUTO_SYMBOLS
+    for sym in symbols:
+        try:
+            candles = await fetch_candles(sym)
+            res = strategy.analyze(candles, PARAMS)
+        except Exception as e:
+            await send(chat_id, f"❌ {esc(sym)}: shamlar olinmadi ({esc(e)})")
+            continue
+        if not res.get("ok"):
+            await send(chat_id, f"❌ {esc(sym)}: {esc(res.get('why'))}")
+            continue
+        trend = {"UP": "⬆️ yuqoriga", "DOWN": "⬇️ pastga", "FLAT": "➡️ yon (aniq emas)"}[res["trend"]]
+        age = (time.time() - (res["t"] + TF_SECONDS[AUTO_TF])) / 60
+        vr = f"{res['vol_ratio']:.1f}x" if res["vol_ratio"] is not None else "—"
+        lines = [
+            f"📊 <b>{esc(sym)}</b> · {AUTO_TF}",
+            f"💰 Oxirgi sham yopilishi: {fmt(res['price'])} ({age:.0f} daq oldin)",
+            f"📈 Trend: {trend} (EMA{PARAMS.ema_fast}/{PARAMS.ema_slow})",
+            f"RSI: {res['rsi']:.0f} · ATR: {fmt(res['atr'])} · Hajm: {vr}",
+            f"{PARAMS.lookback} sham oralig'i: {fmt(res['lo'])} – {fmt(res['hi'])}",
+        ]
+        if age > 3 * TF_SECONDS[AUTO_TF] / 60:
+            lines.append("⏸ Ma'lumot eski — bozor yopiq bo'lishi mumkin.")
+        sig = res["signal"]
+        if sig:
+            lines.append(f"🔔 <b>Hozir signal bor:</b> {sig['side']} · {sig['setup']} · {strategy.stars_text(sig['stars'])}")
+            lines.append(f"📝 {esc(sig['reason'])}")
+        else:
+            lines.append("🔕 Signal yo'q: " + esc("; ".join(res["notes"])))
+        await send(chat_id, "\n".join(lines))
 
 
 # ───────────────────────── Telegram buyruqlari ─────────────────────────
@@ -584,6 +841,9 @@ HELP = (
     "/signallar — signal chiqqandan keyin necha pips yurgani\n"
     "<code>/tuzat XAUUSD 4181.35</code> — narxni Exness'ga moslash\n"
     "<code>/yopish 3</code> — signal kuzatuvini to'xtatish\n\n"
+    "<b>Avto-signal (oltin + bitcoin):</b>\n"
+    "/avto — holat · <code>/avto test</code> (faqat sizga) · <code>/avto kanal</code> (hammaga) · <code>/avto off</code>\n"
+    "/tahlil — hozirgi bozor holati va signal bo'lmasa sababi\n\n"
     "<b>Signaldan keyin:</b> bot narxni kuzatadi va +50, +100 pips yurganda "
     "signal postiga reply qilib yozadi. Izohda SL/TP bo'lsa, urilganini ham yozadi.\n\n"
     "Oltin: <code>XAUUSD</code> (yoki XAU, oltin, gold). Kumush: <code>XAGUSD</code>.\n"
@@ -782,6 +1042,8 @@ COMMANDS = {
     "/signallar": cmd_signallar,
     "/tuzat": cmd_tuzat,
     "/yopish": cmd_yopish,
+    "/avto": cmd_avto,
+    "/tahlil": cmd_tahlil,
 }
 
 
@@ -818,6 +1080,8 @@ async def poll_loop():
         {"command": "signallar", "description": "Kuzatilayotgan signallar (pips)"},
         {"command": "tuzat", "description": "Narxni Exness'ga moslash: /tuzat XAUUSD 4181.35"},
         {"command": "yopish", "description": "Signal kuzatuvini to'xtatish: /yopish 3"},
+        {"command": "avto", "description": "Avto-signal: /avto test | kanal | off"},
+        {"command": "tahlil", "description": "Oltin/BTC hozirgi tahlili"},
         {"command": "help", "description": "Yordam"},
     ])
     offset = None
@@ -988,7 +1252,7 @@ async def price_feed(request):
 
 async def health(_):
     feeds = ", ".join(f"{s}={fmt(v[1])} ({time.time() - v[0]:.0f}s oldin)" for s, v in feed_prices.items())
-    return web.Response(text=f"Zona bot ishlayapti ✅ ({len(zones)} ta faol zona)\nMT5 narxi: {feeds or 'kelmayapti'}")
+    return web.Response(text=f"Zona bot ishlayapti ✅ ({len(zones)} ta faol zona)\nMT5 narxi: {feeds or 'kelmayapti'}\nAvto-signal: {auto['mode']}")
 
 
 # ───────────────────────── ishga tushirish ─────────────────────────
@@ -1003,9 +1267,11 @@ async def on_startup(app):
     if not ADMIN_IDS:
         log.warning("ADMIN_ID yo'q — botga hech kim buyruq bera olmaydi")
     load_zones()
+    auto_load()
     if BOT_TOKEN:
         tasks.append(asyncio.create_task(poll_loop()))
     tasks.append(asyncio.create_task(price_loop()))
+    tasks.append(asyncio.create_task(auto_loop()))
 
 
 async def on_cleanup(app):

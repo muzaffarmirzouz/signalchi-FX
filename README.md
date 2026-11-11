@@ -77,3 +77,54 @@ Message'ga JSON emas, oddiy matn yozsangiz ham ishlaydi — shunchaki o'sha matn
 - Maydonlardan keraksizini o'chirib tashlashingiz yoki o'zingiznikini qo'shishingiz mumkin — bot hammasini ko'rsatadi.
 - Maxfiy so'z (`key`) noto'g'ri bo'lsa bot so'rovni rad etadi, shuning uchun manzilni hech kimga bermang.
 - TradingView webhook faqat standart portlarga (443) yuboradi — Railway domeni shunga mos.
+
+---
+
+## 🤖 Avto-signal (oltin + bitcoin)
+
+Bot endi zona yozmasangiz ham **XAUUSD** va **BTCUSDT** shamlarini o'zi tahlil qilib signal beradi
+(`strategy.py`). Shamlar: oltin — Bitget, bitcoin — Binance. Kirish narxi esa botning odatdagi
+manbasidan olinadi (MT5/Exness tuzatishi bilan).
+
+**Qoidalar (15 daqiqalik yopilgan sham bo'yicha):**
+
+| Setap | Shart |
+|---|---|
+| **Breakout** | sham oldingi 20 shamning eng yuqorisidan (BUY) / eng pastidan (SELL) yopildi, EMA20/EMA50 trendi shu tomonga, RSI haddan oshmagan (BUY < 75, SELL > 25) |
+| **RSI qaytishi** | RSI 30 dan yuqoriga (BUY) yoki 70 dan pastga (SELL) qaytdi va sham shu tomonga yopildi (trendga qarshi, shuning uchun qat'iy) |
+
+Har signalga **kuch (⭐1–4)**: katta sham tanasi, hajm portlashi, sham chekkada yopilishi, soya (rad etish) uchun ball.
+`AUTO_MIN_STARS` (standart 2) dan past signallar yuborilmaydi.
+**SL = 1.5 × ATR**, **TP = 2.5 × ATR** (breakout) yoki 2 × ATR (qaytish). Signal chiqqach, mavjud kuzatuv ishlaydi:
++50/+100 pips, SL yoki TP urilganda signal postiga reply bo'ladi.
+
+**Himoyalar:** bir juftlik+yo'nalishda 60 daqiqa tanaffus, kuniga ≤ 5 signal/juftlik, shu yo'nalishda ochiq signal
+bo'lsa yangisi chiqmaydi, eski (bot o'chib yoqilgandan keyingi) shamlar signal bermaydi.
+
+### Rejimlar (Telegram'dan boshqariladi)
+
+| Buyruq | Ma'nosi |
+|---|---|
+| `/avto test` | **Standart.** Signal faqat adminga (`ADMIN_ID` / shaxsiy `CHAT_ID`) boradi, "🧪 TEST" belgisi bilan |
+| `/avto kanal` | Signal `CHAT_ID` dagi hammaga (kanal) boradi |
+| `/avto off` | Avto-signal o'chiq |
+| `/avto` | Holat: rejim, qabul qiluvchilar, bugungi signallar soni |
+| `/tahlil` | Hozirgi trend, RSI, ATR va **signal bo'lmasa sababi** (sinash uchun foydali) |
+
+Rejim `auto_state.json` ga saqlanadi (Railway Volume uchun `DATA_DIR=/data` qo'ying, aks holda qayta deploy'da
+rejim standartga — `test` ga — qaytadi).
+
+### Qo'shimcha o'zgaruvchilar (hammasi ixtiyoriy)
+
+`AUTO_MODE` (test/kanal/off) · `AUTO_SYMBOLS` (`XAUUSD,BTCUSDT`) · `AUTO_TF` (`5m`/`15m`/`30m`/`1h`) ·
+`AUTO_MIN_STARS` · `AUTO_COOLDOWN_MIN` · `AUTO_MAX_PER_DAY` · `AUTO_TEST_CHAT`
+
+### Test
+
+```
+python3 tests/test_strategy.py
+```
+
+> ⚠️ Bu qoidalar foyda kafolatlamaydi. Kanalga ochishdan oldin kamida 1–2 hafta test rejimida
+> signallarni kuzating (`/signallar` va TP/SL natijalari) va kerak bo'lsa `AUTO_MIN_STARS` ni oshiring.
+> Bu moliyaviy maslahat emas.
