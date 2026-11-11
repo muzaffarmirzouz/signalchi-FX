@@ -963,7 +963,8 @@ HELP = (
     "<code>/yopish 3</code> — signal kuzatuvini to'xtatish\n\n"
     "<b>Avto-signal (oltin + bitcoin):</b>\n"
     "/avto — holat · <code>/avto test</code> (faqat sizga) · <code>/avto kanal</code> (hammaga) · <code>/avto off</code>\n"
-    "/tahlil — hozirgi bozor holati va signal bo'lmasa sababi\n\n"
+    "/tahlil — hozirgi bozor holati va signal bo'lmasa sababi\n"
+    "/mt5 — MT5 (Exness) narxi ulanganmi va farqi qancha\n\n"
     "<b>Signaldan keyin:</b> bot narxni kuzatadi va +50, +100 pips yurganda "
     "signal postiga reply qilib yozadi. Izohda SL/TP bo'lsa, urilganini ham yozadi.\n\n"
     "Oltin: <code>XAUUSD</code> (yoki XAU, oltin, gold). Kumush: <code>XAGUSD</code>.\n"
@@ -1161,6 +1162,36 @@ async def cmd_tuzat(chat_id, args):
     ]))
 
 
+async def cmd_mt5(chat_id, args):
+    """MT5 narx ulanishi: narx yangimi, boshqa manba bilan farqi qancha."""
+    syms = [norm_symbol(a) for a in args] or sorted(set(AUTO_SYMBOLS) | set(feed_prices))
+    lines = ["🔌 <b>MT5 narx ulanishi</b>", ""]
+    if not feed_prices:
+        lines += ["❌ MT5 dan hali narx kelmagan.",
+                  "MT5 da ZonaPriceFeed EA ishlayotganini, URL ruxsat etilganini va key to'g'riligini tekshiring (README: MT5 bo'limi).", ""]
+    for s in syms:
+        f = feed_prices.get(s)
+        if f is None:
+            lines.append(f"⚪️ {esc(s)}: MT5 narxi kelmayapti")
+            continue
+        age = time.time() - f[0]
+        other, src = None, None
+        try:
+            if s in METALS:
+                other, src = await fetch_metal_raw(s)
+            else:
+                other, src = (await fetch_binance([s])).get(s), "Binance"
+        except Exception:
+            pass
+        icon = "🟢" if age <= FEED_MAX_AGE else "🟡 eski"
+        row = f"{icon} {esc(s)}: Bid <b>{fmt(f[1])}</b> / Ask {fmt(f[2])} · {age:.0f}s oldin"
+        if other:
+            row += f"\n    {esc(src)} bilan farq: {f[1] - other:+.2f}"
+        lines.append(row)
+    lines += ["", "MT5 narxi yangi bo'lsa, bot hamma narxlarni (signal, pips, SL/TP) shundan oladi — /tuzat kerak emas."]
+    await send(chat_id, "\n".join(lines))
+
+
 async def cmd_help(chat_id, _):
     await send(chat_id, HELP)
 
@@ -1180,6 +1211,7 @@ COMMANDS = {
     "/yopish": cmd_yopish,
     "/avto": cmd_avto,
     "/tahlil": cmd_tahlil,
+    "/mt5": cmd_mt5,
 }
 
 
@@ -1218,6 +1250,7 @@ async def poll_loop():
         {"command": "yopish", "description": "Signal kuzatuvini to'xtatish: /yopish 3"},
         {"command": "avto", "description": "Avto-signal: /avto test | kanal | off"},
         {"command": "tahlil", "description": "Oltin/BTC hozirgi tahlili"},
+        {"command": "mt5", "description": "MT5 narx ulanishi holati"},
         {"command": "help", "description": "Yordam"},
     ])
     offset = None
@@ -1371,7 +1404,7 @@ async def price_feed(request):
     if SECRET and request.query.get("key", "") != SECRET:
         return web.Response(status=403, text="forbidden")
     try:
-        data = json.loads(await request.text())
+        data = json.loads((await request.text()).strip().strip("\x00"))  # ba'zi EA'lar oxiriga nol bayt qo'shadi
         symbol = norm_symbol(str(data["symbol"]))
         bid = float(data["bid"])
         ask = float(data.get("ask") or bid)
