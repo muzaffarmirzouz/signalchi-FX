@@ -49,6 +49,7 @@ from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout
 
 import strategy
+import report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zona-bot")
@@ -98,6 +99,9 @@ if AUTO_ENTRY not in ("pending", "market"):
     AUTO_ENTRY = "pending"
 AUTO_PULLBACK_ATR = float(os.environ.get("AUTO_PULLBACK_ATR", 0.5))
 AUTO_PENDING_MIN = float(os.environ.get("AUTO_PENDING_MIN", 120))
+# kunlik hisobot: mahalliy soat (Toshkent = UTC+5) bo'yicha, har kuni REPORT_HOUR:00 da
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", 23))
+TZ_HOURS = float(os.environ.get("TZ_HOURS", 5))
 KLINES_API = os.environ.get("KLINES_API", "https://data-api.binance.vision/api/v3/klines")
 BITGET_CANDLES_API = os.environ.get("BITGET_CANDLES_API", "https://api.bitget.com/api/v2/mix/market/candles")
 BITGET_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H"}
@@ -114,6 +118,7 @@ http = None          # aiohttp ClientSession
 zones = []           # [{id, symbol, low, high, note, state, side}]
 trades = []          # signal chiqqandan keyin kuzatilayotganlar
 pendings = []        # avto-signal: kirish narxiga yetishini kutayotganlar
+history = []         # yopilgan signallar natijasi (kunlik hisobot uchun)
 next_id = 1
 tasks = []
 metal_cache = {}     # {"XAUUSD": (vaqt, narx, manba)}
@@ -267,6 +272,7 @@ def open_trade(z, price: float, msg_ids: dict):
     }
     if z.get("auto"):
         t["auto"] = True
+        t["setup"], t["stars"] = z.get("setup"), z.get("stars")
     trades.append(t)
     return t
 
@@ -289,11 +295,13 @@ def check_trade(t, price: float):
                 f"Kirish: {fmt(t['entry'])} → SL: {fmt(t['sl'])}"]
         if t["best"] >= 1:
             text.append(f"Eng yaxshi natija: {fmt_pips(t['best'])} pips")
+        t["result"], t["exit"] = "SL", t["sl"]
         return "\n".join(text), True
 
     # 2) TP
     if t["tp"] is not None and ((t["side"] == "BUY" and price >= t["tp"]) or (t["side"] == "SELL" and price <= t["tp"])):
         tp_pips = pips_of(t, t["tp"])
+        t["result"], t["exit"] = "TP", t["tp"]
         return "\n".join([f"🏆 <b>TP urildi! {fmt_pips(tp_pips)} pips</b> 🔥", trade_head(t),
                           f"Kirish: {fmt(t['entry'])} → TP: {fmt(t['tp'])}"]), True
 
@@ -304,12 +312,16 @@ def check_trade(t, price: float):
         top = max(new_hits)
         last = t["tp"] is None and top >= PIP_TARGETS[-1]
         title = f"🏁 <b>Signal yakunlandi: +{top} pips</b> 🔥" if last else f"✅ <b>+{top} pips</b> 🔥"
+        if last:
+            t["result"], t["exit"] = "PIPS", price
         return "\n".join([title, trade_head(t), line]), last
 
     # 4) vaqt tugadi
     if time.time() - t["opened"] > TRACK_HOURS * 3600:
         log.info("#%s kuzatuv vaqti tugadi (eng yaxshi %.0f pips)", t["id"], t["best"])
-        return None, True
+        t["result"], t["exit"] = "TIMEOUT", price
+        return "\n".join([f"⌛ <b>Kuzatuv muddati tugadi ({TRACK_HOURS:.0f} soat): {fmt_pips(move)} pips</b>",
+                          trade_head(t), line]), True
     return None, False
 
 
@@ -322,6 +334,7 @@ def load_zones():
         zones, next_id = data.get("zones", []), data.get("next_id", 1)
         trades[:] = data.get("trades", [])
         pendings[:] = data.get("pendings", [])
+        history[:] = data.get("history", [])
         offsets.clear()
         offsets.update({k: v for k, v in data.get("offsets", {}).items() if isinstance(v, list)})
         log.info("%d ta zona, %d ta kuzatilayotgan signal yuklandi", len(zones), len(trades))
@@ -335,7 +348,7 @@ def load_zones():
 def save_zones():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = ZONES_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades, "pendings": pendings, "offsets": offsets}, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades, "pendings": pendings, "history": history, "offsets": offsets}, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(ZONES_FILE)
 
 
@@ -598,6 +611,9 @@ async def check_once():
         if done:
             closed.add(t["id"])
     if closed:
+        for t in trades:
+            if t["id"] in closed:
+                record_history(t)
         trades[:] = [t for t in trades if t["id"] not in closed]
     if changed or fired or closed:
         save_zones()
@@ -627,6 +643,7 @@ def auto_load():
         data = json.loads(AUTO_FILE.read_text(encoding="utf-8"))
         if data.get("mode") in ("test", "kanal", "off"):
             auto["mode"] = data["mode"]
+        auto["last_report"] = data.get("last_report", "")
         for k in ("last_bar", "last_sig", "count"):
             if isinstance(data.get(k), dict):
                 auto[k] = data[k]
@@ -747,8 +764,12 @@ def activated_text(p, price) -> str:
     ])
 
 
-async def cancel_pending(p, reason: str):
+async def cancel_pending(p, reason: str, count: bool = True):
     log.info("Pending #%s %s %s bekor: %s", p["id"], p["symbol"], p["side"], reason)
+    if count:
+        history.append({"id": p["id"], "symbol": p["symbol"], "side": p["side"], "auto": True, "setup": p.get("setup"),
+                        "stars": p.get("stars"), "entry": p.get("entry"), "exit": None, "result": "NOFILL",
+                        "pips": 0.0, "r": None, "opened": p.get("created", time.time()), "closed": time.time()})
     text = (f"❌ <b>Signal bekor bo'ldi</b>\n{esc(p['symbol'])} {p['side']} (kirish {fmt(p['entry'])})\n"
             f"Sabab: {esc(reason)}\n<i>Pozitsiya ochmang — bu signal endi kuchda emas.</i>")
     await broadcast(text, reply_to=p.get("msgs"), chats=p.get("chats"))
@@ -774,7 +795,8 @@ async def check_pendings(prices: dict) -> bool:
             else:
                 ids = await broadcast(activated_text(p, price), reply_to=p.get("msgs"), chats=p.get("chats"))
                 ids = ids or {str(c): None for c in p.get("chats", [])}  # xabar ketmasa ham kuzatuv o'sha chatlarga
-                z = {"id": p["id"], "symbol": p["symbol"], "side": p["side"], "sl": p["sl"], "tp": p["tp"], "auto": True}
+                z = {"id": p["id"], "symbol": p["symbol"], "side": p["side"], "sl": p["sl"], "tp": p["tp"], "auto": True,
+                     "setup": p.get("setup"), "stars": p.get("stars")}
                 open_trade(z, price, ids)
                 log.info("Pending #%s %s %s AKTIV narx=%s", p["id"], p["symbol"], p["side"], price)
             done.add(p["id"])
@@ -849,7 +871,8 @@ async def auto_check_once():
             save_zones()
             continue
         sl, tp = strategy.levels(sig["side"], price, sig["sl_dist"], sig["tp_dist"])
-        z = {"id": next_id, "symbol": sym, "side": sig["side"], "sl": sl, "tp": tp, "auto": True}
+        z = {"id": next_id, "symbol": sym, "side": sig["side"], "sl": sl, "tp": tp, "auto": True,
+             "setup": sig["setup"], "stars": sig["stars"]}
         msg_ids = await broadcast(auto_signal_text(sym, price, sig, sl, tp, auto["mode"] == "test"), chats=targets)
         if not msg_ids:
             continue
@@ -943,6 +966,122 @@ async def cmd_tahlil(chat_id, args):
         await send(chat_id, "\n".join(lines))
 
 
+# ───────────────────────── natijalar tarixi va kunlik hisobot ─────────────────────────
+
+def record_history(t):
+    """Yopilgan signal natijasini saqlaydi (kunlik hisobot shundan tuziladi)."""
+    exit_px = t.get("exit")
+    pips = pips_of(t, exit_px) if exit_px is not None else 0.0
+    sl_pips = abs(t["entry"] - t["sl"]) / t["pip"] if t.get("sl") is not None else None
+    history.append({
+        "id": t["id"], "symbol": t["symbol"], "side": t["side"], "auto": bool(t.get("auto")),
+        "setup": t.get("setup"), "stars": t.get("stars"), "entry": t["entry"], "exit": exit_px,
+        "result": t.get("result", "?"), "pips": round(pips, 1),
+        "r": round(pips / sl_pips, 2) if sl_pips else None, "opened": t["opened"], "closed": time.time(),
+    })
+    history[:] = report.prune(history, time.time())
+
+
+def _row(b) -> str:
+    extra = f", boshqa {b['other']}" if b["other"] else ""
+    return f"{b['n']} ta (TP {b['tp']}, SL {b['sl']}{extra})"
+
+
+def report_text(entries, title: str, live=None) -> str:
+    """live: {"open": [(trade, pips_now)], "pending": n} — faqat bugungi hisobotda."""
+    a = report.aggregate(entries)
+    t = a["total"]
+    lines = [f"📊 <b>{esc(title)}</b>" + (" · 🧪 TEST rejimi" if auto["mode"] == "test" else ""), ""]
+    if t["n"] == 0:
+        lines.append("Shu davrda yopilgan avto-signal bo'lmadi.")
+    else:
+        lines += [
+            f"Yopilgan signallar: <b>{t['n']}</b> ta → ✅ TP: <b>{t['tp']}</b> · ❌ SL: <b>{t['sl']}</b>"
+            + (f" · ⌛ boshqa: {t['other']}" if t["other"] else ""),
+            f"🎯 Yutuq: <b>{a['win_rate'] * 100:.0f}%</b> · Jami natija: <b>{a['r_total']:+.1f}R</b>",
+            "",
+            f"🟢 BUY: {_row(a['side']['BUY'])}",
+            f"🔴 SELL: {_row(a['side']['SELL'])}",
+        ]
+        for sym, b in sorted(a["symbol"].items()):
+            lines.append(f"📈 {esc(sym)}: {_row(b)} · <b>{fmt_pips(b['pips'])} pips</b>")
+        best, worst = a["best"], a["worst"]
+        if best and best["result"] != "SL" and (best.get("pips") or 0) > 0:
+            lines.append(f"\n🏆 Eng yaxshisi: {esc(best['symbol'])} {best['side']} {fmt_pips(best['pips'])} pips")
+        if worst and (worst.get("pips") or 0) < 0:
+            lines.append(f"💔 Eng yomoni: {esc(worst['symbol'])} {worst['side']} {fmt_pips(worst['pips'])} pips")
+    if a["nofill"]:
+        lines.append(f"⏳ Kirish narxiga yetmay bekor bo'lgan: {a['nofill']} ta")
+    if a["manual"]["n"]:
+        lines.append(f"✍️ Qo'lda/zona signallar: {a['manual']['n']} ta · {fmt_pips(a['manual']['pips'])} pips")
+    if live is not None:
+        for tr, p in live.get("open", []):
+            lines.append(f"🔄 Hali ochiq: {esc(tr['symbol'])} {tr['side']} · hozir {fmt_pips(p)} pips")
+        if live.get("pending"):
+            lines.append(f"⏳ Kirishni kutayotgan: {live['pending']} ta")
+    if 0 < t["n"] < 30:
+        lines += ["", "<i>Namuna kichik (30 dan kam savdo) — natijaga ishonib bo'lmaydi.</i>"]
+    lines += ["", AUTO_DISCLAIMER]
+    return "\n".join(lines)
+
+
+async def build_report(start: float, end: float, title: str, live: bool = False) -> str:
+    entries = report.in_range(history, start, end)
+    snap = None
+    if live:
+        opened = [t for t in trades if t.get("auto")]
+        prices = await fetch_prices([t["symbol"] for t in opened]) if opened else {}
+        snap = {"open": [(t, pips_of(t, prices[t["symbol"]])) for t in opened if t["symbol"] in prices],
+                "pending": len(pendings)}
+    return report_text(entries, title, snap)
+
+
+async def send_daily_report(now: float = None):
+    now = now or time.time()
+    start, end = report.local_day_bounds(now, TZ_HOURS)
+    day = time.strftime("%d.%m.%Y", time.gmtime(start + TZ_HOURS * 3600))
+    text = await build_report(start, min(end, now + 1), f"Kunlik hisobot — {day}", live=True)
+    chats = auto_targets() or test_targets()
+    if not chats:
+        return log.warning("Kunlik hisobot: yuboriladigan chat yo'q")
+    await broadcast(text, chats=chats)
+    log.info("Kunlik hisobot yuborildi: %s", day)
+
+
+async def report_loop():
+    while True:
+        try:
+            now = time.time()
+            lt = time.gmtime(now + TZ_HOURS * 3600)
+            today = time.strftime("%Y-%m-%d", lt)
+            if lt.tm_hour >= REPORT_HOUR and auto.get("last_report") != today:
+                auto["last_report"] = today  # avval belgilaymiz: xato bo'lsa ham takror-takror yubormasin
+                auto_save()
+                await send_daily_report(now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Kunlik hisobotda xato")
+        await asyncio.sleep(30)
+
+
+async def cmd_hisobot(chat_id, args):
+    """/hisobot — bugun (hozirgacha) · /hisobot kecha · /hisobot 7 — oxirgi 7 kun."""
+    now = time.time()
+    start, end = report.local_day_bounds(now, TZ_HOURS)
+    arg = (args[0].lower() if args else "")
+    if arg in ("kecha", "yesterday"):
+        start, end, title, live = start - 86400, start, "Kechagi hisobot", False
+    elif arg.isdigit() and 1 <= int(arg) <= 90:
+        n = int(arg)
+        start, end, title, live = start - (n - 1) * 86400, now + 1, f"Oxirgi {n} kunlik hisobot", n == 1
+    elif arg:
+        return await send(chat_id, "Namuna: <code>/hisobot</code>, <code>/hisobot kecha</code>, <code>/hisobot 7</code>")
+    else:
+        end, title, live = now + 1, "Bugungi hisobot (hozirgacha)", True
+    await send(chat_id, await build_report(start, end, title, live))
+
+
 # ───────────────────────── Telegram buyruqlari ─────────────────────────
 
 HELP = (
@@ -964,7 +1103,9 @@ HELP = (
     "<b>Avto-signal (oltin + bitcoin):</b>\n"
     "/avto — holat · <code>/avto test</code> (faqat sizga) · <code>/avto kanal</code> (hammaga) · <code>/avto off</code>\n"
     "/tahlil — hozirgi bozor holati va signal bo'lmasa sababi\n"
-    "/mt5 — MT5 (Exness) narxi ulanganmi va farqi qancha\n\n"
+    "/mt5 — MT5 (Exness) narxi ulanganmi va farqi qancha\n"
+    "/hisobot — bugungi natija (TP/SL) · <code>/hisobot kecha</code> · <code>/hisobot 7</code> (oxirgi 7 kun). "
+    "Avtomatik hisobot har kuni 23:00 da keladi.\n\n"
     "<b>Signaldan keyin:</b> bot narxni kuzatadi va +50, +100 pips yurganda "
     "signal postiga reply qilib yozadi. Izohda SL/TP bo'lsa, urilganini ham yozadi.\n\n"
     "Oltin: <code>XAUUSD</code> (yoki XAU, oltin, gold). Kumush: <code>XAGUSD</code>.\n"
@@ -1114,7 +1255,7 @@ async def cmd_yopish(chat_id, args):
         return await send(chat_id, "Namuna: <code>/yopish 3</code>")
     before = len(trades) + len(pendings)
     for p in [p for p in pendings if p["id"] in ids]:
-        await cancel_pending(p, "admin bekor qildi (/yopish)")
+        await cancel_pending(p, "admin bekor qildi (/yopish)", count=False)
     pendings[:] = [p for p in pendings if p["id"] not in ids]
     trades[:] = [t for t in trades if t["id"] not in ids]
     save_zones()
@@ -1212,6 +1353,7 @@ COMMANDS = {
     "/avto": cmd_avto,
     "/tahlil": cmd_tahlil,
     "/mt5": cmd_mt5,
+    "/hisobot": cmd_hisobot,
 }
 
 
@@ -1251,6 +1393,7 @@ async def poll_loop():
         {"command": "avto", "description": "Avto-signal: /avto test | kanal | off"},
         {"command": "tahlil", "description": "Oltin/BTC hozirgi tahlili"},
         {"command": "mt5", "description": "MT5 narx ulanishi holati"},
+        {"command": "hisobot", "description": "Natijalar: /hisobot, /hisobot kecha, /hisobot 7"},
         {"command": "help", "description": "Yordam"},
     ])
     offset = None
@@ -1441,6 +1584,7 @@ async def on_startup(app):
         tasks.append(asyncio.create_task(poll_loop()))
     tasks.append(asyncio.create_task(price_loop()))
     tasks.append(asyncio.create_task(auto_loop()))
+    tasks.append(asyncio.create_task(report_loop()))
 
 
 async def on_cleanup(app):

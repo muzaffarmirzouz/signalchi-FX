@@ -196,3 +196,36 @@ pips, SL/TP, zonalar) to'g'ridan-to'g'ri Exness'dan oladi — `/tuzat` kerak ema
 - MT5 o'chsa yoki bozor yopiq bo'lsa, 60 soniyadan keyin bot avtomatik Bitget/Binance (+`/tuzat`) ga qaytadi, EA eski tickni yubormaydi.
 - Signal **shamlari** (breakout/RSI hisobi) hozircha Bitget/Binance'dan; **narxlar** (kirish, pips, SL/TP) MT5'dan.
 - Xato bo'lsa MT5 *Experts* jurnalida sabab yoziladi: `URL ruxsat etilmagan` (3-qadam), `403` (key noto'g'ri).
+
+---
+
+## 📊 Natijalar va kunlik hisobot
+
+Bot har signalning natijasini o'zi yozib boradi: **TP**, **SL**, vaqt tugashi yoki kirishga yetmay bekor bo'lishi.
+Har kuni **23:00 da** (Toshkent vaqti) hisobot yuboradi:
+
+```
+📊 Kunlik hisobot — 11.11.2026 · 🧪 TEST rejimi
+
+Yopilgan signallar: 10 ta → ✅ TP: 5 · ❌ SL: 5
+🎯 Yutuq: 50% · Jami natija: +3.3R
+
+🟢 BUY: 5 ta (TP 3, SL 2)
+🔴 SELL: 5 ta (TP 2, SL 3)
+📈 XAUUSD: 7 ta (TP 4, SL 3) · +235 pips
+📈 BTCUSDT: 3 ta (TP 1, SL 2) · −40 pips
+
+🏆 Eng yaxshisi: ... · 💔 Eng yomoni: ...
+⏳ Kirish narxiga yetmay bekor bo'lgan: 2 ta
+🔄 Hali ochiq: XAUUSD BUY · hozir +10 pips
+```
+
+- Hisobot **hamma** signalni sanaydi (yutgan ham, yutqazgan ham). Jami natija **R** da: SL = −1R, TP = +1.3…1.7R.
+  Pips faqat har juftlik uchun alohida (oltin va bitcoin pips'larini qo'shib bo'lmaydi).
+- Test rejimida hisobot faqat adminga, `/avto kanal` rejimida `CHAT_ID` dagi hammaga (kanalga) boradi.
+- **Qo'lda buyruq:** `/hisobot` (bugun, hozirgacha) · `/hisobot kecha` · `/hisobot 7` (oxirgi 7 kun).
+- Zona/TradingView/`/buy` `/sell` signallari asosiy statistikaga kirmaydi, alohida bitta qator bo'ladi.
+- Sozlash: `REPORT_HOUR` (standart 23), `TZ_HOURS` (standart 5 — Toshkent).
+
+> ⚠️ **Muhim:** natijalar `zones.json`, hisobot belgisi `auto_state.json` da saqlanadi. Railway'da **Volume** ulab
+> `DATA_DIR=/data` qo'ymasangiz, har qayta deploy/restartda tarix o'chadi va hisobot to'liq bo'lmaydi.
