@@ -44,7 +44,10 @@ BITGET_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H"}
 BITGET_SYMBOLS = {"XAUUSD": "XAUUSDT", "XAGUSD": "XAGUSDT"}
 KLINES_API = os.environ.get("KLINES_API", "https://data-api.binance.vision/api/v3/klines")
 BITGET_HISTORY_API = os.environ.get("BITGET_HISTORY_API", "https://api.bitget.com/api/v2/mix/market/history-candles")
-UA = {"User-Agent": "signalchi-fx-backtest/1.0"}
+YAHOO_API = os.environ.get("YAHOO_API", "https://query1.finance.yahoo.com/v8/finance/chart/")
+YAHOO_SYMBOLS = {"XAUUSD": "GC=F", "XAGUSD": "SI=F", "BTCUSDT": "BTC-USD"}
+YAHOO_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m"}
+UA = {"User-Agent": "Mozilla/5.0 (signalchi-fx-backtest/1.0)"}
 
 
 # ───────────────────────── ma'lumot olish ─────────────────────────
@@ -99,6 +102,28 @@ def fetch_bitget(symbol, tf, start_s, end_s):
             break
         end_ms = oldest - 1
         time.sleep(0.2)
+    return rows
+
+
+def fetch_yahoo(symbol, tf, start_s, end_s):
+    """Zaxira manba (Bitget ochilmasa). Eslatma: oltin uchun GC=F fyucherslar narxi spotdan
+    bir necha dollar farq qiladi — backtest uchun (nisbiy harakat) bu muhim emas. Yahoo 15m uchun ~60 kun beradi."""
+    ysym = YAHOO_SYMBOLS.get(symbol)
+    if not ysym:
+        raise RuntimeError(f"Yahoo uchun {symbol} belgilanmagan")
+    data = _get_json(YAHOO_API + urllib.parse.quote(ysym), {
+        "interval": YAHOO_TF[tf], "period1": int(start_s), "period2": int(end_s)})
+    res = ((data.get("chart") or {}).get("result") or [None])[0]
+    if not res:
+        raise RuntimeError(f"Yahoo xato: {str(data.get('chart'))[:200]}")
+    q = res["indicators"]["quote"][0]
+    rows = []
+    for i, t in enumerate(res.get("timestamp") or []):
+        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        if None in (o, h, l, c):
+            continue
+        rows.append({"t": int(t), "o": float(o), "h": float(h), "l": float(l), "c": float(c),
+                     "v": float(q["volume"][i] or 0)})
     return rows
 
 
@@ -326,6 +351,8 @@ def main(argv=None):
     ap.add_argument("--tf", default="15m", choices=sorted(TF_SECONDS))
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--csv", help="tayyor shamlar fayli (tarmoqsiz)")
+    ap.add_argument("--source", choices=("auto", "bitget", "yahoo"), default="auto",
+                    help="auto: Bitget/Binance, ochilmasa Yahoo | yahoo: faqat Yahoo")
     ap.add_argument("--min-stars", type=int, default=2)
     ap.add_argument("--cooldown-min", type=float, default=60)
     ap.add_argument("--max-per-day", type=int, default=5)
@@ -345,11 +372,22 @@ def main(argv=None):
     else:
         end = int(time.time())
         start = end - a.days * 86400
-        fetch = fetch_bitget if sym in BITGET_SYMBOLS else fetch_binance
-        try:
-            candles = clean(fetch(sym, a.tf, start, end), a.tf)
-        except Exception as e:
-            sys.exit(f"Shamlarni olib bo'lmadi: {e}\nTarmoq yopiq bo'lsa, --csv bilan fayl bering.")
+        main_fetch = fetch_bitget if sym in BITGET_SYMBOLS else fetch_binance
+        order = [fetch_yahoo] if a.source == "yahoo" else [main_fetch] if a.source == "bitget" else [main_fetch, fetch_yahoo]
+        candles, err = None, None
+        for fetch in order:
+            try:
+                candles = clean(fetch(sym, a.tf, start, end), a.tf)
+                if len(candles) >= 120:
+                    if fetch is fetch_yahoo:
+                        print("Manba: Yahoo Finance (fyuchers narxi; spotdan biroz farq qiladi)")
+                    break
+            except Exception as e:
+                err = e
+                print(f"{fetch.__name__} ishlamadi: {e}")
+            candles = None
+        if candles is None:
+            sys.exit(f"Shamlarni olib bo'lmadi: {err}\nTarmoq yopiq bo'lsa, --csv bilan fayl bering.")
     candles = [c for c in candles if c["t"] + TF_SECONDS[a.tf] <= time.time() + 2]
     if len(candles) < 120:
         sys.exit(f"Shamlar yetarli emas ({len(candles)}). Kamida ~120 ta kerak.")
