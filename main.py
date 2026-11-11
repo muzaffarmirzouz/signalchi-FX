@@ -26,6 +26,9 @@ Avto-signal (strategy.py) — bot oltin va bitcoin shamlarini o'zi tahlil qilib 
   AUTO_COOLDOWN_MIN - bir juftlik+yo'nalishda signallar orasidagi tanaffus, standart 60
   AUTO_MAX_PER_DAY  - bir juftlikka kuniga eng ko'p signal, standart 5
   AUTO_TEST_CHAT  - (ixtiyoriy) test signallari boradigan ID; bo'lmasa ADMIN_ID
+  AUTO_ENTRY      - "pending" (standart: avval ⏳ kutilmoqda, narx kirishga yetganda ✅ AKTIV) | "market" (darrov kirish)
+  AUTO_PULLBACK_ATR - pending kirish narxi signal narxidan ATR ning shuncha qismi qulayroq, standart 0.5
+  AUTO_PENDING_MIN  - kutish muddati (daqiqa), standart 120; shundan keyin signal bekor bo'ladi
 Rejimni Telegram'dan o'zgartirish: /avto test | /avto kanal | /avto off
 
 MT5 (Exness) narxi: MT5'dagi ZonaPriceFeed EA har 3 soniyada /price ga narx yuboradi.
@@ -90,6 +93,11 @@ AUTO_COOLDOWN = float(os.environ.get("AUTO_COOLDOWN_MIN", 60)) * 60
 AUTO_MAX_PER_DAY = int(os.environ.get("AUTO_MAX_PER_DAY", 5))
 AUTO_MIN_STARS = int(os.environ.get("AUTO_MIN_STARS", 2))
 AUTO_TEST_CHATS = [c.strip() for c in os.environ.get("AUTO_TEST_CHAT", "").split(",") if c.strip()]
+AUTO_ENTRY = os.environ.get("AUTO_ENTRY", "pending").strip().lower()
+if AUTO_ENTRY not in ("pending", "market"):
+    AUTO_ENTRY = "pending"
+AUTO_PULLBACK_ATR = float(os.environ.get("AUTO_PULLBACK_ATR", 0.5))
+AUTO_PENDING_MIN = float(os.environ.get("AUTO_PENDING_MIN", 120))
 KLINES_API = os.environ.get("KLINES_API", "https://data-api.binance.vision/api/v3/klines")
 BITGET_CANDLES_API = os.environ.get("BITGET_CANDLES_API", "https://api.bitget.com/api/v2/mix/market/candles")
 BITGET_TF = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H"}
@@ -105,6 +113,7 @@ ALIASES = {
 http = None          # aiohttp ClientSession
 zones = []           # [{id, symbol, low, high, note, state, side}]
 trades = []          # signal chiqqandan keyin kuzatilayotganlar
+pendings = []        # avto-signal: kirish narxiga yetishini kutayotganlar
 next_id = 1
 tasks = []
 metal_cache = {}     # {"XAUUSD": (vaqt, narx, manba)}
@@ -312,6 +321,7 @@ def load_zones():
         data = json.loads(ZONES_FILE.read_text(encoding="utf-8"))
         zones, next_id = data.get("zones", []), data.get("next_id", 1)
         trades[:] = data.get("trades", [])
+        pendings[:] = data.get("pendings", [])
         offsets.clear()
         offsets.update({k: v for k, v in data.get("offsets", {}).items() if isinstance(v, list)})
         log.info("%d ta zona, %d ta kuzatilayotgan signal yuklandi", len(zones), len(trades))
@@ -325,7 +335,7 @@ def load_zones():
 def save_zones():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = ZONES_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades, "offsets": offsets}, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps({"next_id": next_id, "zones": zones, "trades": trades, "pendings": pendings, "offsets": offsets}, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(ZONES_FILE)
 
 
@@ -544,10 +554,11 @@ def detect_side(symbol: str, price: float, data: dict):
 
 
 async def check_once():
-    wanted = [z["symbol"] for z in zones] + [t["symbol"] for t in trades] + list(HISTORY_SYMBOLS)
+    wanted = ([z["symbol"] for z in zones] + [t["symbol"] for t in trades]
+              + [p["symbol"] for p in pendings] + list(HISTORY_SYMBOLS))
     prices = await fetch_prices(wanted)
     remember_prices(prices)
-    if not zones and not trades:
+    if not zones and not trades and not pendings:
         return
     fired, changed = [], False
     for z in zones:
@@ -566,6 +577,10 @@ async def check_once():
         log.info("Signal: #%s %s %s", z["id"], z["symbol"], price)
         msg_ids = await broadcast(signal_text(z, price, how))
         open_trade(z, price, msg_ids)
+
+    # kutilayotgan avto-signallar: kirish narxiga yetdimi / bekor bo'ldimi
+    if pendings and await check_pendings(prices):
+        changed = True
 
     # ochiq signallarni kuzatish: +50, +100 pips, SL, TP
     closed = set()
@@ -691,6 +706,89 @@ def auto_signal_text(symbol, price, sig, sl, tp, test: bool) -> str:
     return "\n".join(lines)
 
 
+def _rr_lines(symbol, entry, sl, tp, sl_dist, tp_dist):
+    ps = pip_size(symbol, entry)
+    return [
+        f"🛑 SL: <b>{fmt(sl)}</b> ({fmt_pips(-sl_dist / ps)} pips)",
+        f"🎯 TP: <b>{fmt(tp)}</b> ({fmt_pips(tp_dist / ps)} pips)",
+        f"⚖️ Risk : Foyda = 1 : {tp_dist / sl_dist:.2f}",
+    ]
+
+
+def pending_text(p, price, test: bool) -> str:
+    icon = "🟢" if p["side"] == "BUY" else "🔴"
+    setup = {"breakout": "Breakout (yorib o'tish)", "reversal": "RSI qaytishi"}.get(p["setup"], p["setup"])
+    way = "tushganda" if p["side"] == "BUY" else "ko'tarilganda"
+    return "\n".join([
+        f"⏳{icon} <b>SIGNAL KUTILMOQDA: {p['side']}</b>",
+        "🤖 Avto-signal" + (" · 🧪 <b>TEST rejimi</b>" if test else ""),
+        "",
+        f"📈 Juftlik: <b>{esc(p['symbol'])}</b> · {AUTO_TF}",
+        f"💰 Hozirgi narx: {fmt(price)}",
+        f"📥 Kirish: <b>{fmt(p['entry'])}</b> — narx shu darajaga {way} signal AKTIV bo'ladi",
+        *_rr_lines(p["symbol"], p["entry"], p["sl"], p["tp"], p["sl_dist"], p["tp_dist"]),
+        f"📊 Setap: {setup} · Kuch: {strategy.stars_text(p['stars'])}",
+        f"📝 {esc(p['reason'])}",
+        "",
+        f"⏱ {AUTO_PENDING_MIN:.0f} daqiqada yetmasa yoki narx kirishsiz {fmt(p['tp'])} ga ketsa — signal bekor bo'ladi.",
+        AUTO_DISCLAIMER,
+    ])
+
+
+def activated_text(p, price) -> str:
+    icon = "🟢" if p["side"] == "BUY" else "🔴"
+    return "\n".join([
+        f"✅{icon} <b>SIGNAL AKTIV: {p['side']}</b>",
+        "",
+        f"📈 {esc(p['symbol'])} · kirish narxi yetdi: <b>{fmt(price)}</b>",
+        *_rr_lines(p["symbol"], price, p["sl"], p["tp"], abs(price - p["sl"]), abs(p["tp"] - price)),
+        "",
+        "Endi bot +pips, TP va SL ni kuzatib boradi.",
+    ])
+
+
+async def cancel_pending(p, reason: str):
+    log.info("Pending #%s %s %s bekor: %s", p["id"], p["symbol"], p["side"], reason)
+    text = (f"❌ <b>Signal bekor bo'ldi</b>\n{esc(p['symbol'])} {p['side']} (kirish {fmt(p['entry'])})\n"
+            f"Sabab: {esc(reason)}\n<i>Pozitsiya ochmang — bu signal endi kuchda emas.</i>")
+    await broadcast(text, reply_to=p.get("msgs"), chats=p.get("chats"))
+
+
+async def check_pendings(prices: dict) -> bool:
+    """Kutilayotgan signallar: kirish narxiga yetdi -> aktiv; muddat tugadi/narx ketib qoldi -> bekor."""
+    now, done = time.time(), set()
+    for p in list(pendings):
+        price = prices.get(p["symbol"])
+        buy = p["side"] == "BUY"
+        if now > p["expires"]:
+            await cancel_pending(p, f"{AUTO_PENDING_MIN:.0f} daqiqa ichida narx {fmt(p['entry'])} ga yetmadi")
+            done.add(p["id"])
+            continue
+        if price is None:
+            continue
+        reached = price <= p["entry"] if buy else price >= p["entry"]
+        if reached:
+            beyond_sl = price <= p["sl"] if buy else price >= p["sl"]
+            if beyond_sl:
+                await cancel_pending(p, f"narx kirishdan sakrab SL ({fmt(p['sl'])}) dan o'tib ketdi")
+            else:
+                ids = await broadcast(activated_text(p, price), reply_to=p.get("msgs"), chats=p.get("chats"))
+                ids = ids or {str(c): None for c in p.get("chats", [])}  # xabar ketmasa ham kuzatuv o'sha chatlarga
+                z = {"id": p["id"], "symbol": p["symbol"], "side": p["side"], "sl": p["sl"], "tp": p["tp"], "auto": True}
+                open_trade(z, price, ids)
+                log.info("Pending #%s %s %s AKTIV narx=%s", p["id"], p["symbol"], p["side"], price)
+            done.add(p["id"])
+            continue
+        missed = price >= p["tp"] if buy else price <= p["tp"]
+        if missed:
+            await cancel_pending(p, f"narx kirishga tushmay, TP ({fmt(p['tp'])}) tomonga ketib qoldi")
+            done.add(p["id"])
+    if done:
+        pendings[:] = [p for p in pendings if p["id"] not in done]
+        save_zones()
+    return bool(done)
+
+
 async def auto_check_once():
     global next_id
     if auto["mode"] == "off":
@@ -724,13 +822,32 @@ async def auto_check_once():
         if auto["count"].get(sym, 0) >= AUTO_MAX_PER_DAY:
             log.info("Avto-signal: %s bugungi limit tugadi", sym)
             continue
-        if any(t["symbol"] == sym and t["side"] == sig["side"] for t in trades):
-            log.info("Avto-signal: %s uchun shu yo'nalishda signal hali ochiq", key)
+        if any(x["symbol"] == sym and x["side"] == sig["side"] for x in trades + pendings):
+            log.info("Avto-signal: %s uchun shu yo'nalishda signal hali ochiq/kutilmoqda", key)
             continue
         if not targets:
             log.warning("Avto-signal: %s signal bor, lekin yuboriladigan chat yo'q (rejim=%s)", key, auto["mode"])
             continue
         price = (await fetch_prices([sym])).get(sym) or res["price"]
+        if AUTO_ENTRY == "pending" and AUTO_PULLBACK_ATR > 0:
+            pb = AUTO_PULLBACK_ATR * res["atr"]
+            entry = price - pb if sig["side"] == "BUY" else price + pb
+            sl, tp = strategy.levels(sig["side"], entry, sig["sl_dist"], sig["tp_dist"])
+            p = {"id": next_id, "symbol": sym, "side": sig["side"], "setup": sig["setup"], "stars": sig["stars"],
+                 "reason": sig["reason"], "entry": entry, "sl": sl, "tp": tp, "sl_dist": sig["sl_dist"],
+                 "tp_dist": sig["tp_dist"], "created": time.time(), "expires": time.time() + AUTO_PENDING_MIN * 60}
+            msg_ids = await broadcast(pending_text(p, price, auto["mode"] == "test"), chats=targets)
+            if not msg_ids:
+                continue
+            p["msgs"], p["chats"] = msg_ids, [str(c) for c in msg_ids]
+            pendings.append(p)
+            next_id += 1
+            auto["last_sig"][key] = time.time()
+            auto["count"][sym] = auto["count"].get(sym, 0) + 1
+            log.info("Avto-signal KUTILMOQDA #%s %s %s narx=%s kirish=%s SL=%s TP=%s kuch=%s rejim=%s", p["id"], sym,
+                     sig["side"], price, round(entry, 2), round(sl, 2), round(tp, 2), sig["stars"], auto["mode"])
+            save_zones()
+            continue
         sl, tp = strategy.levels(sig["side"], price, sig["sl_dist"], sig["tp_dist"])
         z = {"id": next_id, "symbol": sym, "side": sig["side"], "sl": sl, "tp": tp, "auto": True}
         msg_ids = await broadcast(auto_signal_text(sym, price, sig, sl, tp, auto["mode"] == "test"), chats=targets)
@@ -780,6 +897,9 @@ async def cmd_avto(chat_id, args):
         f"🤖 <b>Avto-signal</b>: {names[auto['mode']]}",
         f"📈 Kuzatiladi: {esc(', '.join(AUTO_SYMBOLS))} · {AUTO_TF}",
         f"⭐ Eng kam kuch: {AUTO_MIN_STARS} · tanaffus {AUTO_COOLDOWN / 60:.0f} daq · kuniga ≤ {AUTO_MAX_PER_DAY}/juftlik",
+        (f"📥 Kirish: ⏳ kutiladi (ATR × {AUTO_PULLBACK_ATR:g} qulayroq narx, {AUTO_PENDING_MIN:.0f} daq) · "
+         f"hozir kutayotgan: {len(pendings)}" if AUTO_ENTRY == "pending" and AUTO_PULLBACK_ATR > 0
+         else "📥 Kirish: darrov (market)"),
         f"📬 Qabul qiluvchilar: {esc(', '.join(tg_list)) if tg_list else 'yo‘q'}",
         f"📊 Bugun: {esc(', '.join(f'{k} {v}' for k, v in auto['count'].items()) or 'signal bo‘lmadi')}",
         "🕒 " + "; ".join(bars),
@@ -960,10 +1080,23 @@ async def cmd_narx(chat_id, args):
 
 
 async def cmd_signallar(chat_id, _):
-    if not trades:
+    if not trades and not pendings:
         return await send(chat_id, "Hozir kuzatilayotgan signal yo'q.")
-    prices = await fetch_prices(t["symbol"] for t in trades)
-    lines = [f"📊 <b>Kuzatilayotgan signallar ({len(trades)} ta)</b>", ""]
+    prices = await fetch_prices([t["symbol"] for t in trades] + [p["symbol"] for p in pendings])
+    lines = []
+    if pendings:
+        lines += [f"⏳ <b>Kirishni kutayotgan ({len(pendings)} ta)</b>", ""]
+        for p in pendings:
+            now_p = prices.get(p["symbol"])
+            left = max(0, (p["expires"] - time.time()) / 60)
+            icon = "🟢" if p["side"] == "BUY" else "🔴"
+            lines.append(f"<b>#{p['id']}</b> {icon} {esc(p['symbol'])} {p['side']} — kirish {fmt(p['entry'])}"
+                         + (f" · hozir {fmt(now_p)}" if now_p is not None else "") + f" · {left:.0f} daq qoldi")
+        lines.append("")
+    if not trades:
+        lines.append("Bekor qilish: <code>/yopish raqam</code>")
+        return await send(chat_id, "\n".join(lines))
+    lines += [f"📊 <b>Kuzatilayotgan signallar ({len(trades)} ta)</b>", ""]
     for t in trades:
         p = prices.get(t["symbol"])
         now = f" · hozir {fmt_pips(pips_of(t, p))} pips" if p is not None else ""
@@ -978,10 +1111,13 @@ async def cmd_yopish(chat_id, args):
     ids = {int(a.lstrip("#")) for a in args if a.lstrip("#").isdigit()}
     if not ids:
         return await send(chat_id, "Namuna: <code>/yopish 3</code>")
-    before = len(trades)
+    before = len(trades) + len(pendings)
+    for p in [p for p in pendings if p["id"] in ids]:
+        await cancel_pending(p, "admin bekor qildi (/yopish)")
+    pendings[:] = [p for p in pendings if p["id"] not in ids]
     trades[:] = [t for t in trades if t["id"] not in ids]
     save_zones()
-    n = before - len(trades)
+    n = before - len(trades) - len(pendings)
     await send(chat_id, f"⏹ {n} ta signal kuzatuvi to'xtatildi." if n else "Bunday raqamli signal topilmadi.")
 
 
