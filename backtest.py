@@ -8,6 +8,7 @@ Bot jonli rejimda qanday ishlasa, shu yerda ham xuddi shunday:
   * tanaffus (AUTO_COOLDOWN_MIN), kunlik limit (AUTO_MAX_PER_DAY) va
     "shu yo'nalishda ochiq signal bor" qoidasi bir xil.
 
+Kirish rejimi: --entry pending (bot standarti: qulayroq narx kutiladi, yetmasa signal bekor) yoki market.
 Natija R birligida: SL = -1R, TP = +(TP/SL) R (breakout 1.67R, qaytish 1.33R).
 Bir shamda ham SL, ham TP ga tegsa — konservativ hisob: SL birinchi deb olinadi.
 Faqat standart kutubxona (aiohttp kerak emas) — kompyuteringizda ham ishlaydi.
@@ -175,7 +176,26 @@ def resolve_trade(candles, i, side, entry, sl, tp, max_hours):
     return "OPEN", len(candles) - 1, candles[-1]["c"]
 
 
-def simulate(candles, params=None, cooldown_min=60, max_per_day=5, max_hours=48, cost_r=0.0, window=300):
+def resolve_pending(candles, i, side, entry, tp, pending_min):
+    """Kutilayotgan signal: i-shamdan keyin kirish narxiga yetdimi?
+    Qaytaradi: ('FILLED', shamIndeksi) yoki ('NOFILL', shamIndeksi) — muddat tugadi yoki narx
+    kirishsiz TP darajasiga ketib qoldi (jonli bot ham shunday bekor qiladi)."""
+    t0 = candles[i]["t"]
+    for j in range(i + 1, len(candles)):
+        b = candles[j]
+        if b["t"] - t0 > pending_min * 60:
+            return "NOFILL", j
+        if (side == "BUY" and b["l"] <= entry) or (side == "SELL" and b["h"] >= entry):
+            return "FILLED", j
+        if (side == "BUY" and b["h"] >= tp) or (side == "SELL" and b["l"] <= tp):
+            return "NOFILL", j
+    return "OPEN", len(candles) - 1
+
+
+def simulate(candles, params=None, cooldown_min=60, max_per_day=5, max_hours=48, cost_r=0.0, window=300,
+             entry_mode="market", pullback_atr=0.5, pending_min=120):
+    """entry_mode: 'market' — signal shamining yopilishida darrov kirish;
+    'pending' — kirish narxi ATR*pullback_atr qulayroq, narx yetgandagina savdo ochiladi."""
     params = params or strategy.Params()
     need = max(params.ema_slow, params.rsi_len, params.atr_len, params.lookback) + 5
     trades, last_sig, day_count, open_trades = [], {}, {}, []
@@ -194,8 +214,29 @@ def simulate(candles, params=None, cooldown_min=60, max_per_day=5, max_hours=48,
         if any(o["side"] == side and o["exit_idx"] > i for o in open_trades):
             continue
         entry = bar["c"]
+        pending = entry_mode == "pending" and pullback_atr > 0
+        if pending:
+            pb = pullback_atr * res["atr"]
+            entry = entry - pb if side == "BUY" else entry + pb
         sl, tp = strategy.levels(side, entry, sig["sl_dist"], sig["tp_dist"])
-        outcome, j, px = resolve_trade(candles, i, side, entry, sl, tp, max_hours)
+        if pending:
+            state, f = resolve_pending(candles, i, side, entry, tp, pending_min)
+            if state != "FILLED":
+                t = {"t": bar["t"], "side": side, "setup": sig["setup"], "stars": sig["stars"], "entry": entry,
+                     "sl": sl, "tp": tp, "outcome": "NOFILL" if state == "NOFILL" else "OPEN",
+                     "exit_idx": f, "exit_t": candles[f]["t"], "r": 0.0}
+                open_trades.append(t)
+                last_sig[key] = bar["t"]
+                day_count[day] = day_count.get(day, 0) + 1
+                trades.append(t)
+                continue
+            fb = candles[f]  # to'ldirilgan sham: konservativ — faqat SL tekshiriladi, TP keyingi shamdan
+            if (side == "BUY" and fb["l"] <= sl) or (side == "SELL" and fb["h"] >= sl):
+                outcome, j, px = "SL", f, sl
+            else:
+                outcome, j, px = resolve_trade(candles, f, side, entry, sl, tp, max_hours)
+        else:
+            outcome, j, px = resolve_trade(candles, i, side, entry, sl, tp, max_hours)
         move = (px - entry) if side == "BUY" else (entry - px)
         r = move / sig["sl_dist"] - cost_r
         t = {"t": bar["t"], "side": side, "setup": sig["setup"], "stars": sig["stars"], "entry": entry,
@@ -209,10 +250,11 @@ def simulate(candles, params=None, cooldown_min=60, max_per_day=5, max_hours=48,
 
 def summarize(trades):
     """Yopilgan savdolar (OPEN emas) bo'yicha statistika."""
-    done = [t for t in trades if t["outcome"] != "OPEN"]
+    done = [t for t in trades if t["outcome"] not in ("OPEN", "NOFILL")]
+    nofill = sum(t["outcome"] == "NOFILL" for t in trades)
     n = len(done)
     if n == 0:
-        return {"n": 0}
+        return {"n": 0, "nofill": nofill}
     wins = [t for t in done if t["r"] > 0]
     losses = [t for t in done if t["r"] <= 0]
     gross_w, gross_l = sum(t["r"] for t in wins), -sum(t["r"] for t in losses)
@@ -235,7 +277,9 @@ def summarize(trades):
         "profit_factor": (gross_w / gross_l) if gross_l > 0 else float("inf"),
         "max_dd_r": max_dd,
         "max_losing_streak": max_streak,
-        "open": len(trades) - n,
+        "open": len(trades) - n - nofill,
+        "nofill": nofill,
+        "signals": len(trades),
     }
 
 
@@ -243,7 +287,8 @@ def fmt_row(label, s):
     if not s["n"]:
         return f"{label:<22} savdo yo'q"
     pf = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
-    return (f"{label:<22} {s['n']:>4} ta | yutuq {s['win_rate'] * 100:>3.0f}% (TP {s['tp']}, SL {s['sl']}, vaqt {s['timeout']}) | "
+    fill = f" (signal {s['signals']}, kirishsiz bekor {s['nofill']})" if s.get("nofill") else ""
+    return (f"{label:<22} {s['n']:>4} ta{fill} | yutuq {s['win_rate'] * 100:>3.0f}% (TP {s['tp']}, SL {s['sl']}, vaqt {s['timeout']}) | "
             f"o'rtacha {s['avg_r']:+.2f}R | jami {s['total_r']:+.1f}R | PF {pf} | maks. tushish {s['max_dd_r']:.1f}R | "
             f"ketma-ket SL ≤ {s['max_losing_streak']}")
 
@@ -286,6 +331,11 @@ def main(argv=None):
     ap.add_argument("--max-per-day", type=int, default=5)
     ap.add_argument("--max-hours", type=float, default=48, help="savdo shuncha soatdan keyin yopiladi")
     ap.add_argument("--cost-r", type=float, default=0.0, help="har savdoga spred/slippage (R birligida)")
+    ap.add_argument("--entry", choices=("pending", "market"), default="pending",
+                    help="pending: kirish narxi kutiladi (bot standarti) | market: signal shamida darrov kirish")
+    ap.add_argument("--pullback", type=float, default=0.5, help="pending kirish: ATR ning shuncha qismi qulayroq narx")
+    ap.add_argument("--pending-min", type=float, default=120, help="pending signal shuncha daqiqadan keyin bekor bo'ladi")
+    ap.add_argument("--compare", action="store_true", help="market va pending natijalarini yonma-yon solishtirish")
     ap.add_argument("--json", action="store_true", help="savdolar ro'yxatini JSON qilib chiqarish")
     a = ap.parse_args(argv)
 
@@ -305,8 +355,18 @@ def main(argv=None):
         sys.exit(f"Shamlar yetarli emas ({len(candles)}). Kamida ~120 ta kerak.")
 
     params = strategy.Params(min_stars=a.min_stars)
-    trades = simulate(candles, params, a.cooldown_min, a.max_per_day, a.max_hours, a.cost_r)
+    def run(mode):
+        return simulate(candles, params, a.cooldown_min, a.max_per_day, a.max_hours, a.cost_r,
+                        entry_mode=mode, pullback_atr=a.pullback, pending_min=a.pending_min)
+
+    trades = run(a.entry)
+    print(f"Kirish rejimi: {a.entry}" + (f" (ATR × {a.pullback:g}, {a.pending_min:.0f} daq)" if a.entry == "pending" else ""))
     print(report(sym, a.tf, candles, trades))
+    if a.compare:
+        print("\n═══ SOLISHTIRISH (hammasi) ═══")
+        for mode in ("market", "pending"):
+            print(fmt_row(f"  {mode}", summarize(trades if mode == a.entry else run(mode))))
+        print("Eslatma: pending'da savdo kamroq, lekin kirish narxi yaxshiroq; qaysi biri yuqori jami R beradi, shuni tanlang.")
     if a.json:
         print(json.dumps(trades, ensure_ascii=False, indent=1))
 

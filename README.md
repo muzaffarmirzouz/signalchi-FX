@@ -117,7 +117,23 @@ rejim standartga — `test` ga — qaytadi).
 ### Qo'shimcha o'zgaruvchilar (hammasi ixtiyoriy)
 
 `AUTO_MODE` (test/kanal/off) · `AUTO_SYMBOLS` (`XAUUSD,BTCUSDT`) · `AUTO_TF` (`5m`/`15m`/`30m`/`1h`) ·
-`AUTO_MIN_STARS` · `AUTO_COOLDOWN_MIN` · `AUTO_MAX_PER_DAY` · `AUTO_TEST_CHAT`
+`AUTO_MIN_STARS` · `AUTO_COOLDOWN_MIN` · `AUTO_MAX_PER_DAY` · `AUTO_TEST_CHAT` ·
+`AUTO_ENTRY` (`pending` standart / `market`) · `AUTO_PULLBACK_ATR` (0.5) · `AUTO_PENDING_MIN` (120)
+
+### ⏳ Kutiladigan kirish (pending) → ✅ Signal AKTIV
+
+Standart (`AUTO_ENTRY=pending`): strategiya signal topganda bot darrov kirishni aytmaydi, balki
+**qulayroq kirish narxini** (signal narxidan ATR × 0.5 pastda BUY, yuqorida SELL) belgilaydi:
+
+1. `⏳🟢 SIGNAL KUTILMOQDA: BUY` — kirish, SL, TP yoziladi.
+2. Narx kirishga yetganda `✅🟢 SIGNAL AKTIV: BUY` (signal postiga reply) — **shundan boshlab** +pips / TP / SL kuzatiladi.
+3. Yetmasa `❌ Signal bekor bo'ldi` (reply): 120 daqiqa o'tdi, narx kirishsiz TP tomonga ketib qoldi yoki kirishdan SL ga sakrab o'tdi.
+
+`/signallar` — kutayotgan va ochiq signallar, `/yopish 5` — kutayotgan signalni qo'lda bekor qilish.
+`AUTO_ENTRY=market` — eski usul (signal chiqqan zahoti aktiv).
+
+> Pending avtomatik yaxshiroq emas: kirish narxi yaxshi, lekin kuchli harakatlar kirishsiz ketib qoladi.
+> Qaysi biri yaxshiroq — `python3 backtest.py --symbol XAUUSD --csv ... --compare` bilan **o'z ma'lumotingizda** tekshiring.
 
 ### Test
 
@@ -141,6 +157,8 @@ python3 backtest.py --symbol XAUUSD --days 30
 python3 backtest.py --symbol BTCUSDT --days 60
 python3 backtest.py --symbol XAUUSD --csv exness_xauusd_m15.csv   # MT5'dan eksport (eng aniq: Exness narxi)
 python3 backtest.py --symbol XAUUSD --days 30 --min-stars 3 --cost-r 0.05
+python3 backtest.py --symbol XAUUSD --days 30 --compare   # market va pending yonma-yon
+python3 backtest.py --symbol XAUUSD --days 30 --entry market --pullback 0.3 --pending-min 90
 ```
 
 - Jonli bot bilan **bir xil qoidalar**: tanaffus, kunlik limit, "shu yo'nalishda ochiq signal bor" holati.

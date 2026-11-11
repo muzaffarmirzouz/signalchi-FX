@@ -103,6 +103,65 @@ class SimulateTests(unittest.TestCase):
         self.assertEqual(len([t for t in strict if t["side"] == "BUY"]), 1)
 
 
+class PendingTests(unittest.TestCase):
+    """pending kirish: narx ATR*0.5 qulayroq darajaga yetgandagina savdo ochiladi."""
+
+    def _base(self):
+        closes = wavy(120, 0.08)
+        brk = max(closes[-20:]) + 2.0
+        c = bars(closes + [brk])
+        c[120]["v"] = 300.0
+        res = strategy.analyze(c)
+        self.assertIsNotNone(res["signal"], res["notes"])
+        sig = res["signal"]
+        entry = brk - 0.5 * res["atr"]
+        sl, tp = strategy.levels("BUY", entry, sig["sl_dist"], sig["tp_dist"])
+        return c, brk, entry, sl, tp, sig
+
+    def _bar(self, c, o, h, l, cl):
+        return {"t": c[-1]["t"] + 900, "o": o, "h": h, "l": l, "c": cl, "v": 100.0}
+
+    def _run(self, c, **kw):
+        trades = backtest.simulate(c, strategy.Params(), cooldown_min=0, entry_mode="pending", **kw)
+        got = [t for t in trades if t["t"] == c[120]["t"]]
+        self.assertEqual(len(got), 1, "120-shamda aynan bitta signal bo'lishi kerak")
+        return got[0]
+
+    def test_fill_then_tp(self):
+        c, brk, entry, sl, tp, sig = self._base()
+        c.append(self._bar(c, brk, brk + 0.1, entry - 0.01, entry + 0.2))   # kirishga tushdi (SL ga tegmadi)
+        c.append(self._bar(c, entry + 0.2, tp + 1, entry, tp))              # TP
+        t = self._run(c)
+        self.assertEqual(t["outcome"], "TP")
+        self.assertAlmostEqual(t["r"], sig["tp_dist"] / sig["sl_dist"], places=6)
+        self.assertAlmostEqual(t["entry"], entry, places=6)
+
+    def test_fill_bar_sl_is_conservative(self):
+        c, brk, entry, sl, tp, sig = self._base()
+        c.append(self._bar(c, brk, tp + 1, sl - 0.5, tp))                   # bir shamda kirish, SL va TP
+        t = self._run(c)
+        self.assertEqual(t["outcome"], "SL")
+        self.assertAlmostEqual(t["r"], -1.0, places=6)
+
+    def test_missed_move_is_nofill(self):
+        c, brk, entry, sl, tp, sig = self._base()
+        c.append(self._bar(c, brk, tp + 1, entry + 0.5, tp))                # kirishga tushmay TP tomonga ketdi
+        t = self._run(c)
+        self.assertEqual(t["outcome"], "NOFILL")
+        self.assertEqual(t["r"], 0.0)
+
+    def test_expiry_is_nofill(self):
+        c, brk, entry, sl, tp, sig = self._base()
+        for _ in range(10):                                                 # 150 daqiqa kirishdan yuqorida
+            c.append(self._bar(c, brk, brk + 0.2, entry + 0.5, brk))
+        t = self._run(c, pending_min=120)
+        self.assertEqual(t["outcome"], "NOFILL")
+
+    def test_summary_counts_nofill(self):
+        s = backtest.summarize([{"outcome": "TP", "r": 1.5}, {"outcome": "NOFILL", "r": 0.0}])
+        self.assertEqual((s["n"], s["nofill"], s["signals"]), (1, 1, 2))
+
+
 class CsvTests(unittest.TestCase):
     def test_load_csv_mt5_style(self):
         with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as f:
