@@ -48,7 +48,7 @@ def aggregate(entries, auto_only=True):
         "total": _bucket(), "side": {"BUY": _bucket(), "SELL": _bucket()}, "symbol": {},
         "r_total": 0.0, "best": None, "worst": None,
         "nofill": sum(1 for e in entries if e.get("auto") and e.get("result") == "NOFILL"),
-        "manual": _bucket(), "indi": _bucket(), "indi_r": 0.0,
+        "manual": _bucket(), "indi": _bucket(), "indi_r": 0.0, "indi_strong": _bucket(), "indi_strong_r": 0.0,
     }
     for e in main_set:
         _add(out["total"], e)
@@ -64,6 +64,9 @@ def aggregate(entries, auto_only=True):
     for e in indi:
         _add(out["indi"], e)
         out["indi_r"] += e.get("r") or 0.0
+        if e.get("strong"):
+            _add(out["indi_strong"], e)
+            out["indi_strong_r"] += e.get("r") or 0.0
     n = out["total"]["n"]
     out["win_rate"] = out["total"]["tp"] / n if n else None
     return out
